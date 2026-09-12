@@ -14,6 +14,7 @@
 //! - [proxy]  — 本地代理服务：端点、轮换循环、SSE 出流
 //! - [quota]  — /alpha/* 配额端点的容错解析与月度额度派生（纯函数，无 I/O）
 //! - [openai] — 上游事件 → OpenAI SSE 的有状态转换
+//! - [store] — SQLite 持久化（账号密文、请求流水、规则、设置）
 //! - [time]   — epoch 毫秒 ↔ 公历日期（易错，故独立成模块）
 //! - [upstream] — 上游 HTTP 客户端：伪装头、会话/指纹、请求发送与事件流
 //!
@@ -27,6 +28,7 @@ pub mod pool;
 pub mod proxy;
 pub mod quota;
 pub mod sse;
+pub mod store;
 pub mod time;
 pub mod upstream;
 
@@ -49,6 +51,7 @@ pub use quota::{
     LOW_BALANCE_THRESHOLD,
 };
 pub use sse::{LineBuffer, UpstreamEvent, Usage};
+pub use store::{AccountRow, NewRequest, RequestRow, RouteRuleRow, Store, SCHEMA_VERSION};
 pub use time::{civil_from_days, date_string, format_epoch_ms};
 pub use upstream::{now_ms, EventStream, UpstreamClient};
 

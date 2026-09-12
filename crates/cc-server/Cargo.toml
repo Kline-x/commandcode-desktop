@@ -32,6 +32,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "stream",
   "rustls-tls",
 ] }
+# SQLite：bundled 自带源码，不依赖系统库（三平台行为一致）
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 # 设备指纹（sha256 拼装）与 session 抖动
