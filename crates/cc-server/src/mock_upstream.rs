@@ -40,6 +40,7 @@
 //! 注入 now_ms，与 pool.rs 的约定一致（docs/STYLE.md 2.3）。这样「请求到达时刻」
 //! 可以用确定性的假时钟断言。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -69,6 +70,36 @@ pub const MODELS_PATH: &str = "/provider/v1/models";
 /// 要能看到「先打 Provider API、被拒后再打 CLI」这两次请求落在不同路径上
 /// （docs/PROTOCOL.md 第 1、6 节）。
 pub const PROVIDER_CHAT_PATH: &str = "/provider/v1/chat/completions";
+
+/// 配额端点（docs/PROTOCOL.md 第 1、7 节）：配额轮询器要打的四个只读端点。
+pub const WHOAMI_PATH: &str = "/alpha/whoami";
+/// /alpha/billing/credits。
+pub const CREDITS_PATH: &str = "/alpha/billing/credits";
+/// /alpha/billing/subscriptions（可选带 ?orgId=）。
+pub const SUBSCRIPTIONS_PATH: &str = "/alpha/billing/subscriptions";
+/// /alpha/usage/summary。
+pub const USAGE_SUMMARY_PATH: &str = "/alpha/usage/summary";
+
+/// 四个配额端点的路径清单：mock 用它校验脚本挂载的路径，测试用它遍历。
+pub const QUOTA_PATHS: [&str; 4] = [
+    WHOAMI_PATH,
+    CREDITS_PATH,
+    SUBSCRIPTIONS_PATH,
+    USAGE_SUMMARY_PATH,
+];
+
+/// 默认的 /alpha/whoami 成功体（形状见 docs/PROTOCOL.md 第 7 节）。
+///
+/// 带上 org.id 是刻意的：订阅端点要用它拼 ?orgId=，少了它那条路径就测不到。
+pub const DEFAULT_WHOAMI_BODY: &str =
+    r#"{"user":{"id":"user-1","name":"Tester","userName":"tester"},"org":{"id":"org-1"}}"#;
+/// 默认的 /alpha/billing/credits 成功体：余额 20、两个窗口、无告警。
+pub const DEFAULT_CREDITS_BODY: &str = r#"{"credits":{"monthlyCredits":20,"purchasedCredits":0,"freeCredits":0,"planId":"individual-go"},"windowLimits":{"fiveHour":{"used":1,"cap":10},"weekly":{"used":2,"cap":100}},"belowThreshold":false}"#;
+/// 默认的 /alpha/billing/subscriptions 成功体：已知套餐 + 账期结束（月度额度可派生）。
+pub const DEFAULT_SUBSCRIPTIONS_BODY: &str = r#"{"data":{"planId":"individual-go","status":"active","currentPeriodEnd":"2027-01-01T00:00:00Z"}}"#;
+/// 默认的 /alpha/usage/summary 成功体。
+pub const DEFAULT_USAGE_SUMMARY_BODY: &str =
+    r#"{"data":{"totalCount":3,"successRate":1,"totalTokensIn":10,"totalTokensOut":5}}"#;
 
 /// /alpha/generate 请求头清单（docs/PROTOCOL.md 第 2 节）。
 ///
@@ -180,6 +211,30 @@ impl MockResponse {
     }
 }
 
+/// 一个**配额端点**在本次调用里返回什么。
+///
+/// 与生成端点的 [MockResponse] 分开定义：配额端点没有流式形态，只有
+/// 「200 + JSON」与「非 2xx + 错误信封」两种，混进同一个枚举会让生成侧的
+/// 穷尽匹配凭空多出几个永远走不到的分支。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MockQuotaResponse {
+    /// 返回该端点的默认成功体（见各 `DEFAULT_*_BODY` 常量）。
+    Default,
+    /// 返回指定的状态码与 body 原文。
+    Json {
+        /// HTTP 状态码，必须落在 100..=599；非法值在发送时降级为 500。
+        status: u16,
+        /// 响应体原文（通常是上游的错误信封）。
+        body: String,
+    },
+    /// 不返回响应头，一直等到 mock 收摊为止。
+    ///
+    /// 配额轮询器的整体超时与「上游挂死不会让后台循环停摆」这两条要靠它来测：
+    /// 与生成端点的 [MockResponse::Hang] 同形（docs/PROTOCOL.md #4 说明空闲
+    /// 只计 read() 等待，所以「一个字节都不发」才是真实的长静默形态）。
+    Hang,
+}
+
 /// 行为脚本的一个条目：在一段连续的调用区间内决定「这次请求给出什么响应」。
 ///
 /// 整个脚本被拼成一条**时间线**：每个 [MockBehavior] 占据 responses.len() 个
@@ -269,6 +324,11 @@ pub struct ReceivedRequest {
     pub method: Method,
     /// 请求路径（不含 query）。
     pub path: String,
+    /// 完整请求 target：有 query 时形如 `/alpha/billing/subscriptions?orgId=…`。
+    ///
+    /// 单独记一份是因为订阅端点的 `?orgId=` 正是要断言的行为，只记 [Self::path]
+    /// 会把 query 丢掉、让「参数漏拼」这类 bug 测不出来。
+    pub target: String,
     /// 请求头，键统一为**小写**，断言时不必关心大小写。
     pub headers: Vec<HeaderRecord>,
     /// 请求体原文（UTF-8 有损解码；mock 只服务 JSON，乱码即说明测试写错了）。
@@ -320,6 +380,13 @@ struct MockState {
     /// /alpha/lifecycle-events）消耗——否则「第 1 次 401、第 2 次成功」这类脚本
     /// 会被预请求吃掉，测试断言的是完全无关的请求序号。
     generate_count: std::sync::atomic::AtomicUsize,
+    /// 配额端点的行为脚本：路径 → 响应序列（见 [MockUpstream::set_quota_script]）。
+    ///
+    /// 键用 `&'static str`：四个端点路径都是编译期常量，这样校验挂载路径时
+    /// 不需要分配字符串。
+    quota_scripts: Mutex<HashMap<&'static str, Vec<MockQuotaResponse>>>,
+    /// 每个配额端点各自已消费的脚本下标（独立循环，互不干扰）。
+    quota_cursors: Mutex<HashMap<&'static str, usize>>,
 }
 
 impl MockState {
@@ -395,6 +462,8 @@ impl MockUpstream {
             now_ms,
             hang_released: AtomicBool::new(false),
             generate_count: std::sync::atomic::AtomicUsize::new(0),
+            quota_scripts: Mutex::new(HashMap::new()),
+            quota_cursors: Mutex::new(HashMap::new()),
         });
 
         let app = Router::new()
@@ -405,6 +474,12 @@ impl MockUpstream {
             // 语义一致（mock 侧统一发 NDJSON），测试关心的是「打到了哪条路径」。
             .route(PROVIDER_CHAT_PATH, any(handle_generate))
             .route(MODELS_PATH, any(handle_models))
+            // 配额端点（docs/PROTOCOL.md 第 7 节）：默认成功体 + 可注入脚本，
+            // 让配额轮询器的「独立降级 / 401 短路」能被端到端验证。
+            .route(WHOAMI_PATH, any(handle_quota))
+            .route(CREDITS_PATH, any(handle_quota))
+            .route(SUBSCRIPTIONS_PATH, any(handle_quota))
+            .route(USAGE_SUMMARY_PATH, any(handle_quota))
             .fallback(any(handle_not_found))
             .with_state(Arc::clone(&state));
 
@@ -469,6 +544,32 @@ impl MockUpstream {
         self.state
             .generate_count
             .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 给某个配额端点挂一个响应序列（按该端点自己的调用次数循环取用）。
+    ///
+    /// 配额端点的行为没法塞进 [MockBehavior] 那条时间线：四个端点各自独立，
+    /// 而时间线是**全局**按请求序号取模的——whoami 的一次失败会把 credits 的
+    /// 脚本也往前推一格。这里按路径分开计数，正好对应
+    /// 「某个端点失败不影响其余端点」这条要测的语义（docs/PROTOCOL.md 第 7 节）。
+    ///
+    /// 路径不在 [QUOTA_PATHS] 里时返回 false 且**不挂载**：静默挂到一个永不被路由的
+    /// 路径上会让测试以为脚本生效了，反而更难排查。
+    pub fn set_quota_script(&self, path: &'static str, responses: Vec<MockQuotaResponse>) -> bool {
+        if !QUOTA_PATHS.contains(&path) {
+            return false;
+        }
+        self.state
+            .quota_scripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path, responses);
+        self.state
+            .quota_cursors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(path, 0);
+        true
     }
 
     /// 只包含**生成请求**的记录（排除指纹录制、生命周期等预请求）。
@@ -539,6 +640,7 @@ async fn handle_generate(
     state.record(ReceivedRequest {
         method,
         path: uri.path().to_string(),
+        target: request_target(&uri),
         headers: collect_headers(&headers),
         body: String::from_utf8_lossy(&body).into_owned(),
         sequence: 0,
@@ -594,6 +696,7 @@ async fn handle_models(
     state.record(ReceivedRequest {
         method,
         path: uri.path().to_string(),
+        target: request_target(&uri),
         headers: collect_headers(&headers),
         body: String::new(),
         sequence: 0,
@@ -603,6 +706,110 @@ async fn handle_models(
         StatusCode::OK,
         r#"{"object":"list","data":[{"id":"deepseek/deepseek-v4-pro","object":"model","owned_by":"commandcode"},{"id":"deepseek/deepseek-v4-flash","object":"model","owned_by":"commandcode"}]}"#,
     )
+}
+
+/// 配额端点处理器：四个只读端点共用。
+///
+/// 默认给成功体；测试可用 [MockUpstream::set_quota_script] 覆盖某个端点。
+/// 同样用 any(..) 注册，方法错误时也能留下记录。
+async fn handle_quota(
+    State(state): State<Arc<MockState>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let target = request_target(&uri);
+    state.record(ReceivedRequest {
+        path: uri.path().to_string(),
+        target: target.clone(),
+        method,
+        headers: collect_headers(&headers),
+        body: String::new(),
+        sequence: 0,
+        received_at_ms: state.now_ms,
+    });
+
+    let path = uri.path().to_string();
+    // 路径一定来自路由表（必然是 QUOTA_PATHS 之一），取默认体是安全的兜底。
+    let default_body = default_quota_body(&path);
+    let response = {
+        let mut scripts = state
+            .quota_scripts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match scripts.get_mut(path.as_str()) {
+            Some(responses) if !responses.is_empty() => {
+                let mut cursors = state
+                    .quota_cursors
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let cursor = cursors.entry(quota_path_of(&path)).or_insert(0);
+                let picked = responses[*cursor % responses.len()].clone();
+                *cursor += 1;
+                picked
+            }
+            // 没挂脚本（或挂了空序列）时回默认成功体：空序列几乎必然是测试写错，
+            // 但这里不该让整个 mock 变成 500，否则会把「配额逻辑错」伪装成
+            // 「mock 自己坏了」。
+            _ => MockQuotaResponse::Default,
+        }
+    };
+
+    match response {
+        MockQuotaResponse::Default => json_body(StatusCode::OK, default_body),
+        MockQuotaResponse::Json { status, body } => {
+            // 非法状态码降级为 500 而不是 panic（与生成端点的处理一致）。
+            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            json_body(code, &body)
+        }
+        MockQuotaResponse::Hang => quota_hang_response(Arc::clone(&state)),
+    }
+}
+
+/// 把命中路径映射回 [QUOTA_PATHS] 里的常量，供游标表当键用。
+///
+/// 走到这里的路径必然来自路由表，因此兜底返回 whoami 只是一个「让类型收敛」
+/// 的选择；即便如此也不会 panic。
+fn quota_path_of(path: &str) -> &'static str {
+    QUOTA_PATHS
+        .into_iter()
+        .find(|known| *known == path)
+        .unwrap_or(WHOAMI_PATH)
+}
+
+/// 某个配额端点的默认成功体。
+fn default_quota_body(path: &str) -> &'static str {
+    match quota_path_of(path) {
+        CREDITS_PATH => DEFAULT_CREDITS_BODY,
+        SUBSCRIPTIONS_PATH => DEFAULT_SUBSCRIPTIONS_BODY,
+        USAGE_SUMMARY_PATH => DEFAULT_USAGE_SUMMARY_BODY,
+        _ => DEFAULT_WHOAMI_BODY,
+    }
+}
+
+/// 一直不返回响应头的配额端点响应（超时夹具）。
+///
+/// 与 [hang_response] 的区别是它不设 Content-Type、不留任何 body 语义：
+/// 它要模拟的是「连接建立了但上游一句话都不说」，用于验证调用方的整体超时。
+fn quota_hang_response(state: Arc<MockState>) -> Response {
+    let released = Arc::clone(&state);
+    let body_stream = futures_util::stream::once(async move {
+        while !released.hang_released.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(DEFAULT_EVENT_GAP_MS)).await;
+        }
+        Ok::<Vec<u8>, std::io::Error>(Vec::new())
+    });
+    Response::new(Body::from_stream(body_stream))
+}
+
+/// 取出请求的完整 target（路径 + query），并归一化成以 `/` 开头的形式。
+///
+/// 直接 `uri.to_string()` 在 HTTP/2 下会带上 authority 形式（`scheme://host/path`），
+/// 断言 query 时会平白多出噪声；`path_and_query` 取到的才是转发语义上的 target。
+fn request_target(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| uri.path().to_string())
 }
 
 /// 未命中的路径：回 404，但**仍然记录**这次请求。
@@ -619,6 +826,7 @@ async fn handle_not_found(
     state.record(ReceivedRequest {
         method,
         path: uri.path().to_string(),
+        target: request_target(&uri),
         headers: collect_headers(&headers),
         body: String::from_utf8_lossy(&body).into_owned(),
         sequence: 0,
@@ -626,7 +834,7 @@ async fn handle_not_found(
     });
     json_error(
         StatusCode::NOT_FOUND,
-        "mock_upstream: 未实现的端点（本 mock 只服务 /alpha/generate 与 /provider/v1/models）",
+        "mock_upstream: 未实现的端点（本 mock 只服务 /alpha/generate、/provider/v1/models 与 /alpha/* 配额端点）",
     )
 }
 

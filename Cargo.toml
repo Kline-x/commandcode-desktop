@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# cc-server 是平台无关的核心；src-tauri 是桌面外壳
+members = ["crates/*", "src-tauri"]
 
 # 共享的编译产物目录；.gitignore 已忽略 /target
 [workspace.package]

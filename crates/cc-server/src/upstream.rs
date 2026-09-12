@@ -304,6 +304,60 @@ impl UpstreamClient {
         }
     }
 
+    /// 账户端点（/alpha/whoami、/alpha/billing/* 等）使用的请求头。
+    ///
+    /// **与生成通道的头集有意不同**：生成通道需要完整的伪装（session id、
+    /// traceparent、project slug、taste-learning 等，见 [Self::generate_headers]），
+    /// 而账户端点是普通的只读查询接口，给它们塞生成通道的会话头既无意义，
+    /// 也会让一个探测请求看起来像一次生成。
+    ///
+    /// 依据：MIT 上游 dsh-commandcode-provider 的 accountHeaders（生产在用、
+    /// 214 stars）只带 Authorization + 版本 + 环境三项；本地固化副本见
+    /// third_party/dsh-accounts.ts 所在仓库的 src/adapter.ts:1621。
+    fn account_headers(&self, key: &str) -> reqwest::header::HeaderMap {
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let mut headers = HeaderMap::new();
+        let mut put = |name: &str, value: &str| {
+            if let (Ok(n), Ok(v)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                headers.insert(n, v);
+            }
+        };
+        put("Authorization", &format!("Bearer {key}"));
+        put("Accept", "application/json");
+        put("x-command-code-version", &self.config.cli_version);
+        put("x-cli-environment", "production");
+        headers
+    }
+
+    /// GET 一个账户端点并解析 JSON。
+    ///
+    /// 配额轮询与账户信息查询都走这里。**不直接暴露 reqwest::Client**：
+    /// 请求头、超时、错误分类这三条规则必须只有一处实现，否则调用方会各写一遍
+    /// 并逐渐与主路径分叉。path 必须以 / 开头。
+    pub async fn get_account_json(&self, key: &str, path: &str) -> Result<Value, CcError> {
+        debug_assert!(path.starts_with('/'), "账户端点的 path 必须以 / 开头");
+        let url = format!("{}{}", self.config.api_base.trim_end_matches('/'), path);
+        let response = self
+            .http
+            .get(&url)
+            .headers(self.account_headers(key))
+            // 账户端点必须快速失败：一个挂住的上游不能拖死配额轮询
+            .timeout(Duration::from_millis(crate::config::MODELS_TIMEOUT_MS))
+            .send()
+            .await
+            .map_err(|e| CcError::Transport(format!("{e}")))?;
+        if !response.status().is_success() {
+            return Err(Self::classify_error(response).await);
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| CcError::Protocol(e.to_string()))
+    }
+
     /// 拉取模型目录。
     pub async fn list_models(&self, key: &str) -> Result<Value, CcError> {
         let url = format!(

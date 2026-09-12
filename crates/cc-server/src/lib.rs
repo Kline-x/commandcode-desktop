@@ -13,6 +13,8 @@
 //! - [pool]   — 账号池的可用性判定、选择规则与轮换状态机
 //! - [proxy]  — 本地代理服务：端点、轮换循环、SSE 出流
 //! - [quota]  — /alpha/* 配额端点的容错解析与月度额度派生（纯函数，无 I/O）
+//! - [quota_poller] — 周期性拉取 /alpha/* 配额并广播快照（网络 + 调度）
+//! - [anthropic] — Anthropic Messages ↔ 上游的双向转换（请求 / SSE / 非流式）
 //! - [openai] — 上游事件 → OpenAI SSE 的有状态转换
 //! - [store] — SQLite 持久化（账号密文、请求流水、规则、设置）
 //! - [time]   — epoch 毫秒 ↔ 公历日期（易错，故独立成模块）
@@ -20,19 +22,27 @@
 //!
 //! 上游溯源：协议知识与轮换策略移植自 MIT 许可的社区项目，见 THIRD_PARTY.md。
 
+pub mod anthropic;
 pub mod config;
+pub mod control;
 pub mod convert;
 pub mod error;
 pub mod openai;
 pub mod pool;
 pub mod proxy;
 pub mod quota;
+pub mod quota_poller;
 pub mod sse;
 pub mod store;
 pub mod time;
 pub mod upstream;
 
+pub use anthropic::{
+    anthropic_to_openai, build_anthropic_response, input_tokens_for_anthropic, map_stop_reason,
+    AnthropicSseBuilder, AnthropicSseEvent,
+};
 pub use config::{Config, PublicProtocol, UpstreamProtocol};
+pub use control::{control_router, AccountView, ControlState, RequestView};
 pub use convert::{
     build_generate_body, build_generate_body_with_context, extract_system_prompt, GenerateContext,
     MAX_GENERATE_TOKENS,
@@ -49,6 +59,9 @@ pub use quota::{
     build_snapshot, plan_display_name, plan_monthly_cap, window_reset_wait_ms, AccountIdentity,
     Credits, EndpointResponses, MonthlyQuota, QuotaAlert, QuotaSnapshot, WindowUsage,
     LOW_BALANCE_THRESHOLD,
+};
+pub use quota_poller::{
+    QuotaFetchError, QuotaPoller, QuotaUpdate, DEFAULT_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS,
 };
 pub use sse::{LineBuffer, UpstreamEvent, Usage};
 pub use store::{AccountRow, NewRequest, RequestRow, RouteRuleRow, Store, SCHEMA_VERSION};

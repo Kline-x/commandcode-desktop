@@ -90,7 +90,9 @@ pub struct RouteRuleRow {
 }
 
 /// 落库用的请求记录（id 由数据库分配）。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// 需要 Deserialize：控制面接收代理侧 POST 过来的记录（两者可能不在同一进程）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewRequest {
     /// 发生时刻（epoch 毫秒）。
     pub at_ms: i64,

@@ -1,0 +1,4 @@
+# pnpm 11 默认拦截依赖的构建脚本（供应链防护）。
+# esbuild 是 Vite 的依赖，需要它的安装脚本才能就位；显式放行并在此记录理由。
+allowBuilds:
+  esbuild: true
