@@ -2,11 +2,10 @@
 //!
 //! 拆成 lib + bin 是 Tauri 2 的惯例：移动端需要库目标，桌面端只需一个 bin。
 
-use std::sync::Arc;
-
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod bootstrap;
+mod commands;
 mod secrets;
 mod tray;
 
@@ -47,7 +46,7 @@ pub fn run() {
         ))
         .setup(|app| {
             let handle = app.handle().clone();
-            let state = match bootstrap::start(&handle) {
+            let (state, store) = match bootstrap::start(&handle) {
                 Ok(state) => state,
                 Err(error) => {
                     // 启动失败必须让用户看见原因，而不是留一个空窗口
@@ -67,9 +66,16 @@ pub fn run() {
             window.eval(&init_script)?;
 
             tray::install(&handle, &state)?;
+            // 存储句柄单独 manage：IPC 命令需要它，而它不属性 AppState 的职责
+            app.manage(commands::StoreHandle(store));
             app.manage(state);
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            commands::add_account,
+            commands::control_endpoint,
+            commands::reveal_data_dir,
+        ])
         .on_window_event(|window, event| {
             // 关闭窗口 = 隐藏到托盘；真正退出走托盘菜单。
             // 这与「关窗不停止代理」的产品定义一致（docs/PLAN.md 第 1 节）。

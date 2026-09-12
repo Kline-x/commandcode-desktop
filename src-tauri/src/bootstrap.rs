@@ -25,15 +25,23 @@ pub enum StartupError {
     #[error("无法打开本地数据库：{0}")]
     Database(String),
     /// 端口被占用（另一个实例在跑？）。
-    #[error("无法监听 {addr}：{0}")]
-    Bind { addr: SocketAddr, source: String },
+    #[error("无法监听 {addr}：{reason}")]
+    Bind {
+        /// 试图绑定的地址。
+        addr: SocketAddr,
+        /// 底层错误文本。
+        ///
+        /// 字段名**不能叫 source**：thiserror 会把 source 当作错误链上游，
+        /// 要求它实现 Error，而这里只有一条文本（std::io::Error 本身不可 Clone）。
+        reason: String,
+    },
     /// 核心初始化失败。
     #[error("核心初始化失败：{0}")]
     Core(String),
 }
 
 /// 启动后台服务，返回给前端用的连接信息。
-pub fn start(app: &AppHandle) -> Result<AppState, StartupError> {
+pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
     let data_dir = data_dir(app)?;
     std::fs::create_dir_all(&data_dir).map_err(|e| StartupError::DataDir(e.to_string()))?;
 
@@ -51,7 +59,7 @@ pub fn start(app: &AppHandle) -> Result<AppState, StartupError> {
             addr: "127.0.0.1:0"
                 .parse()
                 .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
-            source: e.to_string(),
+            reason: e.to_string(),
         })?;
 
     let control_state = Arc::new(ControlState::new(store.clone(), control_token.clone()));
@@ -61,13 +69,13 @@ pub fn start(app: &AppHandle) -> Result<AppState, StartupError> {
     let proxy_listener =
         TcpListener::bind((Ipv4Addr::LOCALHOST, 3050)).map_err(|e| StartupError::Bind {
             addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 3050)),
-            source: e.to_string(),
+            reason: e.to_string(),
         })?;
     let proxy_addr = proxy_listener
         .local_addr()
         .map_err(|e| StartupError::Bind {
             addr: "127.0.0.1:3050".parse().unwrap(),
-            source: e.to_string(),
+            reason: e.to_string(),
         })?;
 
     // 从数据库读账号，构造 key 解析器。
@@ -118,12 +126,15 @@ pub fn start(app: &AppHandle) -> Result<AppState, StartupError> {
 
     tracing::info!(%proxy_url, %control_url, "后台服务已启动");
 
-    Ok(AppState {
-        control_base_url: control_url,
-        control_token,
-        proxy_base_url: proxy_url,
-        data_dir,
-    })
+    Ok((
+        AppState {
+            control_base_url: control_url,
+            control_token,
+            proxy_base_url: proxy_url,
+            data_dir,
+        },
+        store,
+    ))
 }
 
 /// 生成前端要执行的注入脚本。
@@ -152,7 +163,7 @@ fn bind_random() -> Result<TcpListener, StartupError> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
     TcpListener::bind(addr).map_err(|e| StartupError::Bind {
         addr,
-        source: e.to_string(),
+        reason: e.to_string(),
     })
 }
 
