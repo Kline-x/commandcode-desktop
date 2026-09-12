@@ -10,8 +10,20 @@ repository.workspace = true
 [lints]
 workspace = true
 
-# 依赖按阶段引入：
-#   Phase 1  axum / reqwest / tokio / sha2 / rand
-#   Phase 2  rusqlite (bundled)
-# 当前仅含纯逻辑（账号池状态机），零依赖 → Linux CI 秒级完成
 [dependencies]
+# 本地代理服务
+axum = "0.8"
+bytes = "1"
+futures-util = "0.3"
+# 上游请求；rustls 避免依赖系统 OpenSSL（三平台一致）
+reqwest = { version = "0.12", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls-tls",
+] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }

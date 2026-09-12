@@ -30,6 +30,9 @@ allow = [
   "MPL-2.0",
   "CC0-1.0",
   "Unlicense",
+  # webpki-roots 的根证书**数据**许可（宽松，允许自由使用与再分发）。
+  # 它随 rustls 引入——我们用 rustls 而非系统 OpenSSL，以保证三平台行为一致。
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
