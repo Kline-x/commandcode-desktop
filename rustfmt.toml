@@ -1,0 +1,12 @@
+# rustfmt 配置 —— 全仓库统一风格
+# 运行：cargo fmt --all -- --check
+#
+# 原则：保持接近默认值，只固定那些「不约定就会在不同人机器上产生 diff」的项。
+#
+# ⚠️ 只使用 **stable** 支持的选项。带 unstable 的配置项（group_imports、
+# imports_granularity、wrap_comments、comment_width、reorder_impl_items 等）
+# 在 stable 工具链上会被忽略并打印告警，因此一律不写。
+
+edition = "2021"
+max_width = 100
+hard_tabs = false

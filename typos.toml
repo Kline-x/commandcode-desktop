@@ -1,0 +1,40 @@
+# typos —— 拼写检查（中英混排，只查英文单词）
+# 运行：typos
+
+[files]
+extend-exclude = [
+  "third_party/",      # 上游固化副本，不修改也不检查
+  "Cargo.lock",
+  "pnpm-lock.yaml",
+  "*.png",
+  "*.ico",
+  "*.icns",
+]
+
+[default]
+locale = "en"
+unicode = true
+
+[default.extend-words]
+# 项目专有名词，避免被误判为拼写错误
+commandcode = "commandcode"
+deepseek = "deepseek"
+hy = "hy"
+zdr = "zdr"
+sse = "sse"
+ttft = "ttft"
+tauri = "tauri"
+cordis = "cordis"
+dsh = "dsh"
+modsearch = "modsearch"
+serde = "serde"
+axum = "axum"
+rusqlite = "rusqlite"
+reqwest = "reqwest"
+stronghold = "stronghold"
+
+[default.extend-identifiers]
+# 上游 JSON 字段名（不得改写）
+reasoning_content = "reasoning_content"
+max_tokens = "max_tokens"
+tool_call_id = "tool_call_id"

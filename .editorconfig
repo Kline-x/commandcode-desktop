@@ -1,0 +1,24 @@
+# 全仓库一致的编辑器行为（跨平台，避免换行符/编码差异污染 diff）
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.rs]
+indent_size = 4
+max_line_length = 100
+
+[*.{toml,yml,yaml}]
+indent_size = 2
+
+[*.md]
+# Markdown 里的行尾空格是「硬换行」，不能裁剪
+trim_trailing_whitespace = false
+
+[*.{ts,tsx,js,jsx,json,css,html}]
+indent_size = 2

@@ -1,3 +1,4 @@
 [toolchain]
+# 三平台统一：CI 与本地都读这个文件，避免「我这儿能编译」的问题
 channel = "stable"
 components = ["rustfmt", "clippy"]

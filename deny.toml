@@ -1,0 +1,39 @@
+# cargo-deny —— 依赖的许可与安全审查
+# 运行：cargo deny check
+
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-apple-darwin" },
+  { triple = "x86_64-apple-darwin" },
+  { triple = "x86_64-pc-windows-msvc" },
+]
+
+[advisories]
+version = 2
+# 有安全公告或 yanked 依赖时失败：依赖问题必须显式处理，不能悄悄放过
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# 只允许与本项目 MIT 兼容的许可
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "MPL-2.0",
+  "CC0-1.0",
+  "Unlicense",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = []

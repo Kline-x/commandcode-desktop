@@ -1,0 +1,66 @@
+#!/usr/bin/env sh
+# Git pre-commit 钩子 —— 与 CI 的日常检查保持一致
+#
+# 安装：scripts/install-hooks.sh
+# 跳过：git commit --no-verify
+#
+# 设计原则：**只跑快速检查**（秒级）。重活交给 CI，避免拖慢每一次提交。
+
+set -e
+
+RED=$(printf '\033[31m'); GREEN=$(printf '\033[32m'); YELLOW=$(printf '\033[33m'); RESET=$(printf '\033[0m')
+
+ok()   { printf '%s OK  %s%s\n' "$GREEN" "$1" "$RESET"; }
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+# 1) third_party/ 是固化的上游副本，不接受本地修改
+if git diff --cached --name-only | grep -q '^third_party/'; then
+  printf '%sFAIL third_party/ 是上游固化副本，不应修改。%s\n' "$RED" "$RESET"
+  printf '     需要更新时请整文件替换并同步 third_party/upstream.json。\n'
+  exit 1
+fi
+ok "third_party/ 未被修改"
+
+# 2) 疑似密钥泄漏（新增行里出现 user_ 加长串）
+if git diff --cached -U0 | grep -E '^\+.*user_[A-Za-z0-9]{20,}' | grep -v 'user_\.\.\.' >/dev/null 2>&1; then
+  printf '%sFAIL 暂存内容疑似包含真实 API key（user_ 开头）。%s\n' "$RED" "$RESET"
+  printf '%s     请从提交中移除，并考虑轮换该密钥。%s\n' "$YELLOW" "$RESET"
+  exit 1
+fi
+ok "未发现明文密钥"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  ok "未安装 cargo，跳过 Rust 检查"
+  exit 0
+fi
+
+# 3) Rust 格式（很快）
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+  printf '%sFAIL 代码格式不符合 rustfmt 规范。运行：cargo fmt --all%s\n' "$RED" "$RESET"
+  exit 1
+fi
+ok "rustfmt 通过"
+
+# 4) 若只改了文档，跳过编译类检查
+changed_rs=$(git diff --cached --name-only | grep -E '\.(rs|toml)$' || true)
+if [ -z "$changed_rs" ]; then
+  ok "无 Rust 变更，跳过 clippy/test"
+  exit 0
+fi
+
+# 5) clippy + test 只针对核心 crate（避免每次提交都编译 Tauri）
+if ! cargo clippy -p cc-server --all-targets -- -D warnings >/dev/null 2>&1; then
+  printf '%sFAIL clippy 有告警。运行：cargo clippy -p cc-server --all-targets -- -D warnings%s\n' "$RED" "$RESET"
+  exit 1
+fi
+ok "clippy 通过"
+
+if ! cargo test -p cc-server >/dev/null 2>&1; then
+  printf '%sFAIL 单测失败。运行：cargo test -p cc-server%s\n' "$RED" "$RESET"
+  exit 1
+fi
+ok "单测通过"
+
+printf '\n%s所有检查通过%s\n' "$GREEN" "$RESET"

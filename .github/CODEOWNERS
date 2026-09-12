@@ -1,0 +1,8 @@
+# 默认 reviewer
+*                   @Kline-x
+
+# 协议与账号池是风险集中区，改动需要 owner 复核
+/docs/PROTOCOL.md   @Kline-x
+/crates/cc-server/src/pool.rs    @Kline-x
+/third_party/       @Kline-x
+/.github/           @Kline-x

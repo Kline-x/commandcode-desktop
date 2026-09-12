@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# 继承仓库级 lint 策略（根 Cargo.toml 的 [workspace.lints]）
+[lints]
+workspace = true
+
 # 依赖按阶段引入：
 #   Phase 1  axum / reqwest / tokio / sha2 / rand
 #   Phase 2  rusqlite (bundled)

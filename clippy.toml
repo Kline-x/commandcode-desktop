@@ -1,0 +1,15 @@
+# clippy.toml —— clippy 的阈值与行为配置
+# Lint 的启用/禁用（allow/deny）在 Cargo.toml 的 [workspace.lints] 中声明。
+
+# 参数过多的阈值：协议转换函数常常需要多个上下文参数，
+# 默认 7 偏紧，放宽到 10 并在 review 中人工把关
+too-many-arguments-threshold = 10
+
+# 类型复杂度阈值：serde 的嵌套类型容易超标
+type-complexity-threshold = 300
+
+# 认知复杂度：SSE 状态机等天然分支较多，阈值放宽
+cognitive-complexity-threshold = 30
+
+# 单字符绑定名：循环里的 i/j 是合理的
+single-char-binding-names-threshold = 5

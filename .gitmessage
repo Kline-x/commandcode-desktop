@@ -1,0 +1,13 @@
+
+# <type>(<scope>): <一句话摘要，祈使句，不加句号>
+#
+# 为什么这么做（不是「改了哪些文件」）。
+# 协议相关改动请引用 docs/PROTOCOL.md 的条目编号，例如：
+#   PROTOCOL.md #2：assistant 的 reasoning 必须回传且排在 [reasoning, text, tool-call] 最前。
+#
+# 可选：验证方式、影响面、遗留问题。
+#
+# ---------- 参考 ----------
+# type : feat | fix | docs | refactor | test | chore | perf | ci
+# scope: pool | sse | quota | store | ui | ci | docs | ...
+# 一次提交只做一件事；格式化的无关 diff 请单独提交。
