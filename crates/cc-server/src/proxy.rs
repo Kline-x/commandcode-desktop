@@ -1,0 +1,776 @@
+//! 本地代理服务：对外 OpenAI 兼容端点，对内驱动账号池 + 上游。
+//!
+//! 一次请求的完整生命周期（见 docs/ARCHITECTURE.md 第 3 节）：
+//!
+//! 1. 解析请求体（保留未知字段）；
+//! 2. 从池中选号（模型路由 → 手动指定 → 轮转首个可用）；
+//! 3. 转换请求体（[crate::convert]）；
+//! 4. 发送上游（带伪装头，[crate::upstream]）；
+//! 5. 若在**出流前**遇到 401/429 → 标记该 key 并换号重试（每 key 一次，有上限）；
+//!    若遇 403 upgrade_required → 记住该 key 只能走 CLI 通道并原样重试；
+//! 6. 把上游事件流翻译成 OpenAI SSE（[crate::openai]）；
+//! 7. 收尾：记录用量与结果。
+//!
+//! **只在出流前轮换**：一旦响应头已发出（客户端已收到 200），就不能再换号重放——
+//! 客户端会看到重复内容。中途断流按错误处理，不重放。
+
+use std::sync::Arc;
+
+use axum::body::Body;
+use axum::extract::State;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use bytes::Bytes;
+use serde_json::{json, Value};
+
+use crate::config::{Config, UpstreamProtocol};
+use crate::convert::{build_generate_body_with_context, GenerateContext};
+use crate::error::{CcError, ErrorEnvelope};
+use crate::openai::{build_completion, to_sse_line, ChunkBuilder, SSE_DONE};
+use crate::pool::{
+    AccountPool, AccountSlot, ModelAccountRule, RejectionKind, ResolvedAccount, Rotation,
+    RotationStep, UsageTotals,
+};
+use crate::upstream::{now_ms, EventStream, UpstreamClient};
+
+/// 账号的凭据解析器：给定槽位，返回其 API key。
+///
+/// 由宿主（Tauri 或测试）注入：cc-server 不关心 key 存在哪里（keychain / 内存 / 文件）。
+pub type KeyResolver = Arc<dyn Fn(&AccountSlot) -> Option<String> + Send + Sync>;
+
+/// 请求完成后的回调（用于落库与推送到 UI）。
+pub type RequestObserver = Arc<dyn Fn(RequestRecord) + Send + Sync>;
+
+/// 一次请求的结果记录。
+#[derive(Debug, Clone)]
+pub struct RequestRecord {
+    /// 完成时刻（epoch 毫秒）。
+    pub at_ms: i64,
+    /// 使用的账号槽位 id。
+    pub account_id: String,
+    /// 模型。
+    pub model: String,
+    /// 上游通道。
+    pub protocol: &'static str,
+    /// 是否流式。
+    pub stream: bool,
+    /// 最终 HTTP 状态。
+    pub status: u16,
+    /// 错误码（成功时为 None）。
+    pub error_code: Option<String>,
+    /// 用量合计（可能跨轮换累加）。
+    pub usage: UsageTotals,
+    /// 尝试过的账号次数。
+    pub attempts: usize,
+    /// 到首字节的耗时（毫秒）；未收到时为 None。
+    pub ttft_ms: Option<i64>,
+    /// 总耗时（毫秒）。
+    pub total_ms: i64,
+}
+
+/// 代理服务的共享状态。
+pub struct ProxyState {
+    /// 配置。
+    pub config: Config,
+    /// 上游客户端。
+    pub upstream: UpstreamClient,
+    /// 账号池（轮换状态）。
+    pub pool: std::sync::Mutex<AccountPool>,
+    /// 槽位列表（配置层事实）。
+    pub slots: Vec<AccountSlot>,
+    /// 凭据解析器。
+    pub resolve_key: KeyResolver,
+    /// 模型 → 账号路由规则。
+    pub rules: Vec<ModelAccountRule>,
+    /// 手动指定的账号 id。
+    pub preferred_id: Option<String>,
+    /// 请求完成回调。
+    pub observer: Option<RequestObserver>,
+}
+
+impl ProxyState {
+    /// 组装一个新的代理状态。
+    pub fn new(
+        config: Config,
+        slots: Vec<AccountSlot>,
+        resolve_key: KeyResolver,
+    ) -> Result<Self, CcError> {
+        let upstream = UpstreamClient::new(config.clone())?;
+        Ok(Self {
+            config,
+            upstream,
+            pool: std::sync::Mutex::new(AccountPool::new()),
+            slots,
+            resolve_key,
+            rules: Vec::new(),
+            preferred_id: None,
+            observer: None,
+        })
+    }
+
+    /// 设置模型路由规则。
+    pub fn with_rules(mut self, rules: Vec<ModelAccountRule>) -> Self {
+        self.rules = rules;
+        self
+    }
+
+    /// 设置手动指定的账号。
+    pub fn with_preferred(mut self, id: Option<String>) -> Self {
+        self.preferred_id = id;
+        self
+    }
+
+    /// 设置请求完成回调。
+    pub fn with_observer(mut self, observer: RequestObserver) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// 解析出当前可用的账号列表。
+    fn resolved(&self) -> Vec<ResolvedAccount> {
+        let keys: Vec<Option<String>> = self
+            .slots
+            .iter()
+            .map(|slot| (self.resolve_key)(slot))
+            .collect();
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        pool.resolve(&self.slots, &keys)
+    }
+
+    /// 选出本次请求要用的账号，没有可用账号时返回池耗尽错误。
+    fn select_account(&self, model: &str) -> Result<ResolvedAccount, CcError> {
+        let accounts = self.resolved();
+        if accounts.is_empty() {
+            return Err(CcError::MissingCredential);
+        }
+        let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        match pool.select(
+            &accounts,
+            model,
+            &self.rules,
+            self.preferred_id.as_deref(),
+            now_ms(),
+        ) {
+            Some(found) => Ok(found.clone()),
+            None => Err(pool.exhausted_error(&accounts, now_ms())),
+        }
+    }
+
+    /// 标记某个 key 被拒绝。
+    fn mark_rejected(&self, key: &str, kind: RejectionKind) {
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        pool.mark_rejected(key, kind);
+    }
+}
+
+/// 构造路由。
+pub fn router(state: Arc<ProxyState>) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(state)
+}
+
+/// 健康检查。
+async fn health(State(state): State<Arc<ProxyState>>) -> Response {
+    axum::Json(json!({
+        "status": "ok",
+        "accounts": state.slots.len(),
+        "api_base": state.config.api_base,
+    }))
+    .into_response()
+}
+
+/// 模型目录：用池中第一个能解析出 key 的账号去取。
+async fn list_models(State(state): State<Arc<ProxyState>>) -> Response {
+    let Some(account) = state.resolved().first().cloned() else {
+        return error_response(&CcError::MissingCredential, ErrorEnvelope::OpenAi);
+    };
+    match state.upstream.list_models(&account.key).await {
+        Ok(value) => axum::Json(value).into_response(),
+        Err(e) => error_response(&e, ErrorEnvelope::OpenAi),
+    }
+}
+
+/// 把错误渲染成 HTTP 响应。
+pub fn error_response(error: &CcError, envelope: ErrorEnvelope) -> Response {
+    let status = StatusCode::from_u16(error.http_status()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut response = axum::Json(error.to_envelope(envelope)).into_response();
+    *response.status_mut() = status;
+    if let Some(wait) = error.retry_after_ms() {
+        if let Ok(value) = HeaderValue::from_str(&(wait / 1000).max(1).to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+    }
+    response
+}
+
+/// 从请求头里取一个字符串值。
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// 从入站请求里提取客户端自带的会话标识。
+///
+/// 上游按 session 组织前缀缓存。客户端若已自带会话 id（Claude Code 等），
+/// 透传它能让同一会话的请求归到一组，提高缓存命中率；缺失时由上游客户端
+/// 按 key 生成一个稳定默认值（见 [crate::upstream::UpstreamClient::session_id]）。
+///
+/// 最短长度要求（>= 8）沿用参考实现：过短的 id 多是客户端占位符，
+/// 透传反而会污染缓存分组。
+fn inbound_session_id(headers: &HeaderMap) -> Option<String> {
+    const CANDIDATES: [&str; 3] = ["x-session-id", "x-claude-code-session-id", "session_id"];
+    CANDIDATES
+        .iter()
+        .find_map(|name| header_str(headers, name))
+        .filter(|value| value.len() >= 8)
+        .map(str::to_string)
+}
+
+/// 入口：OpenAI 兼容的 chat completions。
+async fn chat_completions(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let started = now_ms();
+    let request: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                &CcError::Protocol(format!("请求体不是合法 JSON：{e}")),
+                ErrorEnvelope::OpenAi,
+            );
+        }
+    };
+
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let stream = request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    // 客户端自带的会话 id 会被透传给上游（提升前缀缓存命中），
+    // 这里先取出；缺失时由上游客户端按 key 生成稳定默认值。
+    let client_session = inbound_session_id(&headers);
+
+    // 上游只有流式接口；非流式请求由本地缓冲后一次性返回
+    let first = match state.select_account(&model) {
+        Ok(account) => account,
+        Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+    };
+
+    let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let created = started / 1000;
+    let mut rotation = Rotation::start(first.key.clone());
+    let mut current = first;
+    let mut usage_totals = UsageTotals::default();
+    let mut protocol = state.upstream.initial_protocol(&current.key);
+    let mut ttft_ms: Option<i64> = None;
+    // 传输层错误的载体：只在「拿不到响应」时被写入，写入后立即 break。
+    // 网络断了换号也没用，所以它不参与轮换。
+    // 成功路径一律 return 离开循环，因此 break 到这里时它必然已被赋值。
+    let transport_error: Option<CcError>;
+
+    loop {
+        // 构造请求体（CLI 与 Provider 面共用同一份转换结果）
+        let context = GenerateContext {
+            working_dir: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            date: crate::time::date_string(now_ms()),
+            environment: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+            ..Default::default()
+        };
+        let generate_body =
+            match build_generate_body_with_context(&request, &state.config, &context) {
+                Ok(b) => b,
+                Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+            };
+
+        // 指纹预请求是尽力而为的，失败不影响对话
+        state.upstream.ensure_initialized(&current.key).await;
+        // 客户端会话 id 若存在，优先于按 key 生成的默认 session
+        if let Some(session) = &client_session {
+            state.upstream.adopt_session(&current.key, session);
+        }
+
+        let response = match state
+            .upstream
+            .send_generate(&current.key, protocol, &generate_body)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                transport_error = Some(e);
+                break;
+            }
+        };
+
+        if !response.status().is_success() {
+            let error = UpstreamClient::classify_error(response).await;
+
+            // Go 套餐没有 Provider API 权限：记住并原样重试同一个 key
+            if error.is_upgrade_required() && protocol == UpstreamProtocol::ProviderApi {
+                state.upstream.remember_cli_only(&current.key);
+                protocol = UpstreamProtocol::Cli;
+                continue;
+            }
+
+            // 只有「账号相关」的错误才换号；403 套餐错误换号无用且会误伤整个池
+            state.mark_rejected(
+                &current.key,
+                if error.http_status() == 401 {
+                    RejectionKind::InvalidCredential
+                } else {
+                    RejectionKind::RateLimit
+                },
+            );
+            let next = next_account(&state, &rotation);
+            match rotation.on_failure(&error, next) {
+                RotationStep::Switched { key, .. } => {
+                    current = state
+                        .resolved()
+                        .into_iter()
+                        .find(|a| a.key == key)
+                        .unwrap_or(current);
+                    protocol = state.upstream.initial_protocol(&current.key);
+                    continue;
+                }
+                RotationStep::Exhausted => {
+                    // 全池都试过了：报告池耗尽的语义错误（带最早重置时间）
+                    let accounts = state.resolved();
+                    let pool = state.pool.lock().unwrap_or_else(|e| e.into_inner());
+                    let final_error = if accounts.is_empty() {
+                        error
+                    } else if error.rotates_account() {
+                        pool.exhausted_error(&accounts, now_ms())
+                    } else {
+                        error
+                    };
+                    drop(pool);
+                    record(
+                        &state,
+                        &current,
+                        &model,
+                        protocol,
+                        stream,
+                        &final_error,
+                        &usage_totals,
+                        rotation.attempted(),
+                        ttft_ms,
+                        started,
+                    );
+                    return error_response(&final_error, ErrorEnvelope::OpenAi);
+                }
+                RotationStep::NotRotatable => {
+                    record(
+                        &state,
+                        &current,
+                        &model,
+                        protocol,
+                        stream,
+                        &error,
+                        &usage_totals,
+                        rotation.attempted(),
+                        ttft_ms,
+                        started,
+                    );
+                    return error_response(&error, ErrorEnvelope::OpenAi);
+                }
+            }
+        }
+
+        // --- 成功：开始翻译事件流 ---
+        let mut events = EventStream::new(response, state.config.stream_idle_timeout);
+        if !stream {
+            // 非流式：缓冲全部内容后一次性返回
+            let mut content = String::new();
+            let mut reasoning = String::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            let mut finish = "stop".to_string();
+            loop {
+                match events.next_event().await {
+                    Ok(Some(event)) => {
+                        collect_event(
+                            &event,
+                            &mut content,
+                            &mut reasoning,
+                            &mut tool_calls,
+                            &mut finish,
+                        );
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        record(
+                            &state,
+                            &current,
+                            &model,
+                            protocol,
+                            stream,
+                            &e,
+                            &usage_totals,
+                            rotation.attempted(),
+                            ttft_ms,
+                            started,
+                        );
+                        return error_response(&e, ErrorEnvelope::OpenAi);
+                    }
+                }
+            }
+            if let Some(u) = events.usage() {
+                usage_totals.add(u);
+            }
+            let body = build_completion(
+                &completion_id,
+                created,
+                &model,
+                &content,
+                &reasoning,
+                &tool_calls,
+                &finish,
+                events.usage(),
+            );
+            let record_ok = RequestRecord {
+                at_ms: now_ms(),
+                account_id: current.slot.id.clone(),
+                model: model.clone(),
+                protocol: protocol_name(protocol),
+                stream,
+                status: 200,
+                error_code: None,
+                usage: usage_totals,
+                attempts: rotation.attempted(),
+                ttft_ms: Some(now_ms() - started),
+                total_ms: now_ms() - started,
+            };
+            if let Some(observer) = &state.observer {
+                observer(record_ok);
+            }
+            return axum::Json(body).into_response();
+        }
+
+        // 流式：把事件流翻译成 SSE
+        let mut builder = ChunkBuilder::new(completion_id.clone(), created, model.clone());
+        let stream_state = state.clone();
+        let account = current.clone();
+        let protocol_name = protocol_name(protocol);
+        let model_for_record = model.clone();
+        let mut totals = usage_totals;
+        let mut saw_any = false;
+
+        let output = async_stream::stream! {
+            loop {
+                match events.next_event().await {
+                    Ok(Some(event)) => {
+                        if ttft_ms.is_none() {
+                            ttft_ms = Some(now_ms() - started);
+                        }
+                        saw_any = true;
+                        for chunk in builder.push(&event) {
+                            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(to_sse_line(&chunk)));
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        // 已经出流，无法重放：以 SSE 里的错误事件结束连接
+                        let payload = json!({
+                            "error": { "message": e.to_string(), "type": e.code() }
+                        });
+                        yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                        let rec = RequestRecord {
+                            at_ms: now_ms(),
+                            account_id: account.slot.id.clone(),
+                            model: model_for_record.clone(),
+                            protocol: protocol_name,
+                            stream: true,
+                            status: 200,
+                            error_code: Some(e.code().to_string()),
+                            usage: totals,
+                            attempts: rotation.attempted(),
+                            ttft_ms,
+                            total_ms: now_ms() - started,
+                        };
+                        if let Some(observer) = &stream_state.observer {
+                            observer(rec);
+                        }
+                        return;
+                    }
+                }
+            }
+            if let Some(u) = events.usage() {
+                totals.add(u);
+            }
+            if !saw_any {
+                let e = CcError::EmptyResponse;
+                let payload = json!({
+                    "error": { "message": e.to_string(), "type": e.code() }
+                });
+                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+            }
+            yield Ok(Bytes::from(SSE_DONE));
+            let rec = RequestRecord {
+                at_ms: now_ms(),
+                account_id: account.slot.id.clone(),
+                model: model_for_record.clone(),
+                protocol: protocol_name,
+                stream: true,
+                status: 200,
+                error_code: None,
+                usage: totals,
+                attempts: rotation.attempted(),
+                ttft_ms,
+                total_ms: now_ms() - started,
+            };
+            if let Some(observer) = &stream_state.observer {
+                observer(rec);
+            }
+        };
+
+        let mut response_headers = HeaderMap::new();
+        response_headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        response_headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        response_headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
+        return (response_headers, Body::from_stream(output)).into_response();
+    }
+
+    // 跳出循环只可能是传输层错误（没拿到响应）
+    let error = transport_error.expect("循环只在 transport_error 被赋值后 break");
+    record(
+        &state,
+        &current,
+        &model,
+        protocol,
+        stream,
+        &error,
+        &usage_totals,
+        rotation.attempted(),
+        ttft_ms,
+        started,
+    );
+    error_response(&error, ErrorEnvelope::OpenAi)
+}
+
+/// 解析下一个候选账号（不含已试过的）。
+fn next_account(state: &ProxyState, rotation: &Rotation) -> Option<ResolvedAccount> {
+    let accounts = state.resolved();
+    let pool = state.pool.lock().unwrap_or_else(|e| e.into_inner());
+    pool.select(
+        &accounts,
+        "",
+        &state.rules,
+        state.preferred_id.as_deref(),
+        now_ms(),
+    )
+    .filter(|a| !rotation.has_tried(&a.key))
+    .cloned()
+    .or_else(|| accounts.into_iter().find(|a| !rotation.has_tried(&a.key)))
+}
+
+/// 记录一次请求的结果。
+#[allow(clippy::too_many_arguments)]
+fn record(
+    state: &ProxyState,
+    account: &ResolvedAccount,
+    model: &str,
+    protocol: UpstreamProtocol,
+    stream: bool,
+    error: &CcError,
+    usage: &UsageTotals,
+    attempts: usize,
+    ttft_ms: Option<i64>,
+    started: i64,
+) {
+    let Some(observer) = &state.observer else {
+        return;
+    };
+    observer(RequestRecord {
+        at_ms: now_ms(),
+        account_id: account.slot.id.clone(),
+        model: model.to_string(),
+        protocol: protocol_name(protocol),
+        stream,
+        status: error.http_status(),
+        error_code: Some(error.code().to_string()),
+        usage: *usage,
+        attempts,
+        ttft_ms,
+        total_ms: now_ms() - started,
+    });
+}
+
+/// 上游通道的稳定名字（用于记录与 UI）。
+fn protocol_name(protocol: UpstreamProtocol) -> &'static str {
+    match protocol {
+        UpstreamProtocol::Cli => "cli",
+        UpstreamProtocol::ProviderApi | UpstreamProtocol::Auto => "openai",
+    }
+}
+
+/// 把事件累积到完整响应（非流式路径用）。
+fn collect_event(
+    event: &crate::sse::UpstreamEvent,
+    content: &mut String,
+    reasoning: &mut String,
+    tool_calls: &mut Vec<Value>,
+    finish: &mut String,
+) {
+    use crate::sse::UpstreamEvent as E;
+    match event {
+        E::TextDelta(t) => content.push_str(t),
+        E::ReasoningDelta(t) => reasoning.push_str(t),
+        E::ToolCall { id, name, input } => tool_calls.push(json!({
+            "id": id,
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
+            }
+        })),
+        E::FinishStep { finish_reason, .. } | E::Finish { finish_reason, .. } => {
+            if let Some(r) = finish_reason {
+                *finish = r.clone();
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_names_are_stable() {
+        assert_eq!(protocol_name(UpstreamProtocol::Cli), "cli");
+        assert_eq!(protocol_name(UpstreamProtocol::ProviderApi), "openai");
+        assert_eq!(protocol_name(UpstreamProtocol::Auto), "openai");
+    }
+
+    #[test]
+    fn error_response_carries_retry_after_for_rate_limit() {
+        let err = CcError::RateLimit {
+            message: "exhausted".into(),
+            retry_after_ms: Some(60_000),
+        };
+        let response = error_response(&err, ErrorEnvelope::OpenAi);
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("60"),
+            "Retry-After 应以秒为单位，让 SDK 拿到正确的退避提示"
+        );
+    }
+
+    #[test]
+    fn error_response_shape_differs_by_envelope() {
+        let err = CcError::MissingCredential;
+        let openai = error_response(&err, ErrorEnvelope::OpenAi);
+        assert_eq!(openai.status(), StatusCode::UNAUTHORIZED);
+        let anthropic = error_response(&err, ErrorEnvelope::Anthropic);
+        assert_eq!(anthropic.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn collect_event_accumulates_content_and_tool_calls() {
+        use crate::sse::UpstreamEvent as E;
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut tools = Vec::new();
+        let mut finish = "stop".to_string();
+        collect_event(
+            &E::TextDelta("hi".into()),
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+        );
+        collect_event(
+            &E::ReasoningDelta("think".into()),
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+        );
+        collect_event(
+            &E::ToolCall {
+                id: "c1".into(),
+                name: "f".into(),
+                input: json!({"a": 1}),
+            },
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+        );
+        collect_event(
+            &E::Finish {
+                finish_reason: Some("tool-calls".into()),
+                usage: None,
+            },
+            &mut content,
+            &mut reasoning,
+            &mut tools,
+            &mut finish,
+        );
+        assert_eq!(content, "hi");
+        assert_eq!(reasoning, "think");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(finish, "tool-calls");
+    }
+
+    #[tokio::test]
+    async fn health_reports_ok() {
+        let state =
+            Arc::new(ProxyState::new(Config::default(), Vec::new(), Arc::new(|_| None)).unwrap());
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let body = reqwest::get(format!("http://{addr}/health"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        assert!(
+            body.contains("\"status\":\"ok\""),
+            "health 应返回 status ok，实际：{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_credential_yields_401_in_openai_shape() {
+        let state =
+            Arc::new(ProxyState::new(Config::default(), Vec::new(), Arc::new(|_| None)).unwrap());
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 401);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+}

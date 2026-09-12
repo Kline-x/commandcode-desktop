@@ -184,7 +184,12 @@ impl CcError {
             .map(|w| w as u64)
             .filter(|w| *w <= crate::pool::RETRY_MAX_DELAY_MS);
         let note = earliest_reset_ms
-            .map(|reset| format!("；最早的窗口将于 {} 重置", format_epoch_ms(reset)))
+            .map(|reset| {
+                format!(
+                    "；最早的窗口将于 {} 重置",
+                    crate::time::format_epoch_ms(reset)
+                )
+            })
             .unwrap_or_default();
         CcError::RateLimit {
             message: format!(
@@ -201,32 +206,6 @@ impl CcError {
             retry_after_ms: None,
         }
     }
-}
-
-/// 把 epoch 毫秒格式化为可读的 UTC 时间（错误信息里给人看）。
-///
-/// 不引入 chrono：用 Howard Hinnant 的 civil_from_days 算法自行换算，
-/// 保持依赖精简（本项目目标是单二进制）。
-fn format_epoch_ms(ms: i64) -> String {
-    let secs = ms.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
-    let rem = secs.rem_euclid(86_400);
-    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (y, mo, d) = civil_from_days(days);
-    format!("{y:04}-{mo:02}-{d:02} {h:02}:{m:02}:{s:02} UTC")
-}
-
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 }.div_euclid(146_097);
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -332,8 +311,12 @@ mod tests {
     }
 
     #[test]
-    fn civil_from_days_matches_known_dates() {
-        assert_eq!(civil_from_days(0), (1970, 1, 1));
-        assert_eq!(civil_from_days(19_723), (2024, 1, 1)); // 2024-01-01
+    fn exhausted_error_renders_a_readable_reset_time() {
+        // 换算逻辑本身在 time.rs 单测；这里只验证错误信息真的带上可读时间
+        let err = CcError::all_accounts_exhausted(1, Some(1_704_067_200_000), 0);
+        assert!(
+            err.to_string().contains("2024-01-01"),
+            "错误信息应含可读的重置时间"
+        );
     }
 }

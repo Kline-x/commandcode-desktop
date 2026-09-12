@@ -10,8 +10,19 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# 测试专用：把 src/mock_upstream.rs 编进库，供本 crate 的 integration 测试
+# 以及需要复用 mock 的下游 crate 使用。
+#
+# 为什么不是无条件 pub mod：mock 是测试基础设施，不是运行时能力。
+# 让它从默认构建里消失，发布产物的依赖图与代码体积都不受影响；
+# 单元测试不需要开 feature（cfg(test) 已覆盖），integration 测试经下面的
+# 自引用 dev-dependency 打开它。
+mock = []
+
 [dependencies]
 # 本地代理服务
+async-stream = "0.3"
 axum = "0.8"
 bytes = "1"
 futures-util = "0.3"
@@ -23,7 +34,18 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 serde.workspace = true
 serde_json.workspace = true
+# 设备指纹（sha256 拼装）与 session 抖动
+sha2 = "0.10"
+rand = "0.9"
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+# 自引用：tests/ 下的 integration 测试只能看到库的公开 API，而 mock_upstream
+# 由 feature = "mock" 门控。dev-dependency 只在测试目标生效，不会把 mock 代码
+# 带进 cargo build 与发布产物（详见 src/mock_upstream.rs 的模块文档注释）。
+cc-server = { path = ".", features = ["mock"] }
+# integration 测试用 oneshot 直接驱动 router，无需真实监听端口
+tower = { version = "0.5", features = ["util"] }
