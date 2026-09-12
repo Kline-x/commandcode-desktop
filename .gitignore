@@ -1,0 +1,37 @@
+# Rust / Cargo
+/target
+/src-tauri/target
+**/*.rs.bk
+
+# Node
+node_modules
+dist
+dist-ssr
+*.local
+
+# Tauri
+/src-tauri/gen
+
+# 构建产物
+/src-tauri/binaries/*
+!/src-tauri/binaries/.gitkeep
+
+# 环境与密钥（绝不入库）
+.env
+.env.*
+!.env.example
+
+# 数据库与日志
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# 编辑器 / 系统
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+*.swp

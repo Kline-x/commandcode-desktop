@@ -1,0 +1,43 @@
+{
+  "note": "Vendored upstream sources used as conformance oracles. Do not edit; re-vendor whole files.",
+  "vendoredAt": "2026-09-12",
+  "sources": [
+    {
+      "repo": "https://github.com/MAXeaglet/commandcode-proxy",
+      "commit": "a94181240e96f71fc86019ae87e91fa0f3f0478e",
+      "license": "MIT",
+      "files": [
+        {
+          "local": "third_party/proxy.mjs",
+          "remote": "proxy.mjs"
+        }
+      ]
+    },
+    {
+      "repo": "https://github.com/MAXeaglet/commandcode-usage",
+      "commit": "03aa55bcfb19258b127db10b818bb091c2120fc8",
+      "license": "MIT",
+      "files": [
+        {
+          "local": "third_party/usage-worker.js",
+          "remote": "worker.js"
+        },
+        {
+          "local": "third_party/usage-index.html",
+          "remote": "public/index.html"
+        }
+      ]
+    },
+    {
+      "repo": "https://github.com/Mars-Sea/dsh-commandcode-provider",
+      "commit": "7cf3235c9a774f182a5183046f3cd154901b6527",
+      "license": "MIT",
+      "files": [
+        {
+          "local": "third_party/dsh-accounts.ts",
+          "remote": "src/accounts.ts"
+        }
+      ]
+    }
+  ]
+}
