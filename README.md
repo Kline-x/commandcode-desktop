@@ -1,5 +1,8 @@
 # commandcode-desktop
 
+[![CI](https://github.com/Kline-x/commandcode-desktop/actions/workflows/ci.yml/badge.svg)](https://github.com/Kline-x/commandcode-desktop/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 **Command Code 桌面客户端** — 多账号轮换代理（OpenAI / Anthropic 兼容）+ 实时额度用量面板，跨平台，单二进制。
 
 > 非官方社区项目，与 Command Code, Inc. 无关联。你需要自己的 Command Code 账号与订阅，并遵守其服务条款。

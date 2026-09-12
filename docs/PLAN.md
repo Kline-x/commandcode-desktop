@@ -359,28 +359,49 @@ Phase 0 剩余项：Tauri 2 模板、axum `/health`、`scripts/mock-upstream.mjs
 
 ---
 
-## 15. CI 与成本策略（私有仓库）
+## 15. CI 与仓库设置
 
-仓库为**私有**，GitHub Actions 消耗账户额度，各 runner 的计费系数差异巨大：
+### 仓库可见性与分支保护
 
-| runner | 相对计费 | 本项目用途 |
+仓库为**公开（public）**，这是为了让分支保护在 GitHub Free 计划下可用：
+
+- **分支保护在私有仓库上需要 Pro/Team/Enterprise；公开仓库免费即可用。**
+  实测：私有状态下调用保护 API 返回 `403 Upgrade to GitHub Pro`，切公开后同一调用成功。
+- 公开仓库的 **GitHub Actions 分钟数免费且不限**（标准 GitHub-hosted runner）。
+  私有仓库则按账户共享额度（Free 2000 分钟/月），且 macOS runner 计费系数为 Linux 的 10 倍。
+- 代价：代码与 `third_party/` 中固化的上游源码全部可见。上游均为 MIT，合规。
+
+### `main` 的保护规则（已启用）
+
+| 规则 | 值 | 作用 |
 |---|---|---|
-| `ubuntu-latest` / `ubuntu-22.04` | 1× | **日常 CI**：fmt / clippy / test 核心 crate |
-| `windows-latest` | 2× | 仅 release 时构建 |
-| `macos-14` / `macos-13` | **10×** | 仅 release 时构建 |
+| Required status checks | `check`（strict） | CI 必须绿，且**分支必须与 main 同步**后才能合并 |
+| Required approvals | 1 | 至少 1 人 review |
+| Dismiss stale reviews | 开 | 有新提交时旧 approval 作废 |
+| Require code owner review | 开 | 由 `.github/CODEOWNERS` 指定的人必须批 |
+| Require last push approval | 开 | 最后推送者之外还需他人批准（防自我合并） |
+| Required conversation resolution | 开 | review comment 必须全部 resolve |
+| Required linear history | 开 | 强制 squash/rebase，保持 `main` 线性 |
+| Force push / 删除分支 | 禁止 | — |
+| Enforce admins | **关** | 管理员（Kline-x）可紧急绕过 |
 
-因此：
+> ⚠️ **CODEOWNERS 必须列出所有会开 PR 的人**：GitHub 不允许自我批准，
+> 若只列一人，该人自己开的 PR 会因 `require_code_owner_reviews` 永远无法满足条件（死锁）。
+> 当前列为 `@Kline-x @Ckanglin`，互相可批。
 
-- **日常**（`.github/workflows/ci.yml`）只跑 Linux 上的 `cc-server`：它是平台无关的核心逻辑，
-  不依赖 `webkit2gtk`，秒级完成。`src-tauri` 需要系统 WebKit 依赖，不进日常 CI。
-- **发布**（`.github/workflows/release.yml`）才启用四目标矩阵（macOS arm64/x64、Windows x64、Linux x64），
-  且只在打 tag 或手动触发时运行。
+### CI 工作流
+
+- **日常**（`.github/workflows/ci.yml`）：只跑 Linux 上的 `cc-server`（fmt / clippy / test / typos / cargo-deny）。
+  它平台无关、不依赖 `webkit2gtk`，秒级完成；`src-tauri` 需要系统 WebKit 依赖，不进日常 CI。
+  公开仓库下已无分钟数成本压力，此处纯粹是为了让检查更快。
+- **发布**（`.github/workflows/release.yml`）：四目标矩阵（macOS arm64/x64、Windows x64、Linux x64），
+  仅由 tag 或手动触发。
 - 文档与 `third_party/` 的改动通过 `paths-ignore` 跳过 CI。
 
-### 协作约定
+### 协作流程
 
-- `main` 受保护：必须通过 PR 合并，且至少 1 个 approval；CI `check` 必须绿。
-- 直接推送 `main` 被拒绝；协作者（write 权限）走 PR 流程。
+见 [CONTRIBUTING.md](../CONTRIBUTING.md)。要点：从 `main` 切 `<type>/<描述>` 分支 →
+`scripts/check.sh` 全绿 → 开 PR → 1 人 approve → **squash 合并**。
 
 ---
 

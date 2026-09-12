@@ -120,9 +120,21 @@ PR 标题与提交信息同格式。描述里写清：
   gh pr merge <n> --squash --delete-branch
   ```
 
-> ⚠️ **本仓库无法启用 GitHub 分支保护**（私有仓库 + Free 计划需 Pro 才能用
-> branch protection / rulesets）。因此上面这些是**约定而非强制**——请自觉遵守，
-> 不要直接推 `main`。详见 `docs/PLAN.md` 第 15 节。
+### `main` 的保护规则（已在 GitHub 上强制启用）
+
+| 规则 | 效果 |
+|---|---|
+| Required checks `check`（strict） | CI 必须绿，且分支要与 `main` 同步才能合并 |
+| 1 个 approval | 必须有人 review 通过 |
+| Dismiss stale reviews | 有新提交时旧 approval 自动作废 |
+| Require code owner review | `.github/CODEOWNERS` 指定的人必须批 |
+| Require last push approval | 最后推送者之外还需他人批准 |
+| Conversation resolution | review comment 必须全部 resolve |
+| Linear history | 强制 squash，保持 `main` 线性 |
+| Force push / 删除分支 | 禁止 |
+
+> 管理员（Kline-x）保留了紧急绕过的能力（`enforce_admins` 关闭），但**请正常走 PR 流程**。
+> 详见 `docs/PLAN.md` 第 15 节。
 
 ---
 
@@ -151,11 +163,13 @@ PR 标题与提交信息同格式。描述里写清：
 
 ---
 
-## 8. CI 与成本
+## 8. CI
 
-私有仓库的 Actions 消耗额度，macOS runner 计费是 Linux 的 **10 倍**：
+仓库为**公开**仓库，GitHub-hosted runner 的分钟数免费且不限，所以不必为省额度而克制。 但仍有两条纪律：
 
-- 日常 PR 只跑 Linux 上的 `cc-server`（fmt / clippy / test / typos / deny）
-- 三平台打包**仅在打 tag 时**进行
+- 日常 PR 只跑 Linux 上的 `cc-server`（fmt / clippy / test / typos / cargo-deny）。
+  这不是省额度，而是**检查更快**——`src-tauri` 需要 `webkit2gtk` 等系统依赖，不进日常 CI。
+- 三平台打包只在打 tag 时进行（完整构建耗时较长，没必要每个提交都跑）。
 
-**请在本机把测试跑完再推**，不要把 CI 当编译器使用。
+**请在本机跑完 `scripts/check.sh` 再推**：CI 是用来兜底的，不是拿来当编译器的。
+反馈越快，迭代越快。
