@@ -1,8 +1,11 @@
-# 默认 reviewer
-*                   @Kline-x
+# 默认 reviewer —— 两人都是 owner，互相可以满足 code owner review 要求
+# （GitHub 不允许自我批准，若只写一个人，那个人自己开的 PR 会死锁）
+*                   @Kline-x @Ckanglin
 
-# 协议与账号池是风险集中区，改动需要 owner 复核
-/docs/PROTOCOL.md   @Kline-x
-/crates/cc-server/src/pool.rs    @Kline-x
-/third_party/       @Kline-x
-/.github/           @Kline-x
+# 协议与账号池是风险集中区：这两个路径的改动尤其需要仔细看
+/docs/PROTOCOL.md                @Kline-x @Ckanglin
+/crates/cc-server/src/pool.rs    @Kline-x @Ckanglin
+/third_party/                    @Kline-x @Ckanglin
+/.github/                        @Kline-x @Ckanglin
+/Cargo.toml                      @Kline-x @Ckanglin
+/deny.toml                       @Kline-x @Ckanglin
