@@ -352,8 +352,35 @@ GET    /events                          # SSE: request | quota | account | log
 
 ## 14. 下一步
 
-Phase 0 剩余项：Tauri 模板、axum `/health`、mock 上游、CI 骨架。
+Phase 0 已完成：仓库骨架、`cc-server` crate、账号池状态机（15 个单测全绿）、CI/release 工作流。
+
+Phase 0 剩余项：Tauri 2 模板、axum `/health`、`scripts/mock-upstream.mjs`。
 随后进入 Phase 1（账号池 + 聊天链路），这是全项目风险最集中的一段。
+
+---
+
+## 15. CI 与成本策略（私有仓库）
+
+仓库为**私有**，GitHub Actions 消耗账户额度，各 runner 的计费系数差异巨大：
+
+| runner | 相对计费 | 本项目用途 |
+|---|---|---|
+| `ubuntu-latest` / `ubuntu-22.04` | 1× | **日常 CI**：fmt / clippy / test 核心 crate |
+| `windows-latest` | 2× | 仅 release 时构建 |
+| `macos-14` / `macos-13` | **10×** | 仅 release 时构建 |
+
+因此：
+
+- **日常**（`.github/workflows/ci.yml`）只跑 Linux 上的 `cc-server`：它是平台无关的核心逻辑，
+  不依赖 `webkit2gtk`，秒级完成。`src-tauri` 需要系统 WebKit 依赖，不进日常 CI。
+- **发布**（`.github/workflows/release.yml`）才启用四目标矩阵（macOS arm64/x64、Windows x64、Linux x64），
+  且只在打 tag 或手动触发时运行。
+- 文档与 `third_party/` 的改动通过 `paths-ignore` 跳过 CI。
+
+### 协作约定
+
+- `main` 受保护：必须通过 PR 合并，且至少 1 个 approval；CI `check` 必须绿。
+- 直接推送 `main` 被拒绝；协作者（write 权限）走 PR 流程。
 
 ---
 

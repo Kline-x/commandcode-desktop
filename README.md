@@ -25,7 +25,7 @@ English | 简体中文（本文）
 
 ## 状态
 
-**早期开发中** — 目前处于 Phase 0（骨架）。完整路线图见 [docs/PLAN.md](docs/PLAN.md)。
+**早期开发中** — Phase 0 进行中（仓库骨架、核心 crate、CI 已就绪）。完整路线图见 [docs/PLAN.md](docs/PLAN.md)。
 
 ## 技术栈
 
@@ -45,8 +45,8 @@ pnpm tauri build    # 打包
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| Phase 0 | 骨架、mock 上游、CI 矩阵 | 🚧 进行中 |
-| Phase 1 | 账号池 + 轮换 + 聊天链路 | ⏳ |
+| Phase 0 | 骨架、核心 crate、mock 上游、CI 矩阵 | 🚧 进行中 |
+| Phase 1 | 账号池 + 轮换 + 聊天链路 | 🚧 状态机已落地，链路待做 |
 | Phase 2 | Anthropic 面 + 配额轮询 | ⏳ |
 | Phase 3 | 控制 API + 用量面板 | ⏳ |
 | Phase 4 | 托盘、密钥加密、日志 | ⏳ |

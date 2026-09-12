@@ -1,0 +1,13 @@
+[package]
+name = "cc-server"
+description = "Command Code 客户端核心：协议翻译、账号池、配额解析（不依赖 Tauri）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# 依赖按阶段引入：
+#   Phase 1  axum / reqwest / tokio / sha2 / rand
+#   Phase 2  rusqlite (bundled)
+# 当前仅含纯逻辑（账号池状态机），零依赖 → Linux CI 秒级完成
+[dependencies]

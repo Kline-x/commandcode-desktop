@@ -1,0 +1,16 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# 共享的编译产物目录；.gitignore 已忽略 /target
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Kline-x/commandcode-desktop"
+
+[workspace.dependencies]
+# 依赖在此集中声明，Phase 1 起由各 crate 按需启用（见 docs/PLAN.md 第 4 节）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
