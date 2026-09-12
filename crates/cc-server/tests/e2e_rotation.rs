@@ -46,12 +46,17 @@ fn resolver() -> cc_server::KeyResolver {
 
 /// 发一次对话请求，返回 (状态码, 响应体文本)。
 async fn post_chat(state: Arc<ProxyState>, body: Value) -> (StatusCode, String) {
+    post_to(state, "/v1/chat/completions", body).await
+}
+
+/// 向指定路径发一次 POST，返回 (状态码, 响应体文本)。
+async fn post_to(state: Arc<ProxyState>, uri: &str, body: Value) -> (StatusCode, String) {
     let app = router(state);
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v1/chat/completions")
+                .uri(uri)
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
@@ -399,4 +404,201 @@ async fn health_and_models_endpoints_are_reachable() {
         .unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["object"], "list");
+}
+
+// ---------------------------------------------------------------- Anthropic 面
+
+/// 从 Anthropic SSE 文本里收集 (event, data) 对。
+fn anthropic_events(sse: &str) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    let mut event: Option<String> = None;
+    for line in sse.lines() {
+        if let Some(name) = line.strip_prefix("event: ") {
+            event = Some(name.to_string());
+        } else if let Some(payload) = line.strip_prefix("data: ") {
+            if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                out.push((event.clone().unwrap_or_default(), value));
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn anthropic_stream_emits_the_required_event_sequence() {
+    let mock = MockUpstream::start([MockResponse::StreamSuccess {
+        text: "hello claude".into(),
+    }])
+    .await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, body) = post_to(
+        state,
+        "/v1/messages",
+        json!({
+            "model": "m",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let events = anthropic_events(&body);
+    let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+
+    // Anthropic 的流式事件顺序是硬性的：SDK 会按状态机校验
+    assert_eq!(
+        names.first().copied(),
+        Some("message_start"),
+        "序列必须以 message_start 开头"
+    );
+    assert!(names.contains(&"content_block_start"));
+    assert!(names.contains(&"content_block_delta"));
+    assert!(names.contains(&"content_block_stop"));
+    assert!(names.contains(&"message_delta"));
+    assert_eq!(
+        names.last().copied(),
+        Some("message_stop"),
+        "序列必须以 message_stop 结束"
+    );
+
+    // 文本内容要真的出现
+    let text: String = events
+        .iter()
+        .filter_map(|(_, data)| data["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "hello claude");
+}
+
+#[tokio::test]
+async fn anthropic_non_stream_returns_a_message_object() {
+    let mock = MockUpstream::start([MockResponse::StreamSuccess {
+        text: "buffered".into(),
+    }])
+    .await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, body) = post_to(
+        state,
+        "/v1/messages",
+        json!({
+            "model": "m",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}]
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_str(&body).expect("非流式应返回 JSON");
+    assert_eq!(value["type"], "message");
+    assert_eq!(value["role"], "assistant");
+    assert_eq!(value["content"][0]["type"], "text");
+    assert_eq!(value["content"][0]["text"], "buffered");
+    assert!(value["stop_reason"].is_string());
+}
+
+#[tokio::test]
+async fn anthropic_errors_use_the_anthropic_envelope() {
+    // 无凭据：错误信封必须是 Anthropic 形状，否则 Claude SDK 解析失败
+    let mock = MockUpstream::start([MockResponse::StreamSuccess {
+        text: "never".into(),
+    }])
+    .await;
+    let no_keys: cc_server::KeyResolver = Arc::new(|_: &AccountSlot| None);
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), no_keys).unwrap());
+
+    let (status, body) = post_to(
+        state,
+        "/v1/messages",
+        json!({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["type"], "error",
+        "Anthropic 的错误信封顶层是 type=error"
+    );
+    assert!(value["error"]["type"].is_string());
+    assert!(value["error"]["message"].is_string());
+    assert!(
+        value.get("error").and_then(|e| e.get("code")).is_none()
+            || value["error"]["code"].is_null(),
+        "Anthropic 信封没有 OpenAI 的 code 字段"
+    );
+}
+
+#[tokio::test]
+async fn anthropic_request_also_goes_through_the_account_pool() {
+    // 401 换号逻辑对两种协议都必须生效
+    let mock = MockUpstream::start([
+        MockResponse::HttpError {
+            status: 401,
+            body: r#"{"error":{"code":"x"}}"#.into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "from second".into(),
+        },
+    ])
+    .await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, body) = post_to(
+        state,
+        "/v1/messages",
+        json!({"model": "m", "max_tokens": 10, "messages": [{"role": "user", "content": "hi"}], "stream": true}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mock.generate_count(), 2, "Anthropic 面同样要走账号轮换");
+    let text: String = anthropic_events(&body)
+        .iter()
+        .filter_map(|(_, data)| data["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "from second");
+}
+
+#[tokio::test]
+async fn anthropic_system_and_tools_survive_the_conversion() {
+    // Anthropic 的 system 是顶层字段（不是消息）；tools 用 input_schema。
+    // 转换后必须能在上游请求体里看到它们。
+    let mock = MockUpstream::start([MockResponse::StreamSuccess { text: "ok".into() }]).await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, _) = post_to(
+        state,
+        "/v1/messages",
+        json!({
+            "model": "m",
+            "max_tokens": 100,
+            "system": [{"type": "text", "text": "be terse"}],
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "name": "read_file",
+                "description": "read",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}}
+            }],
+            "stream": true
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let body: Value = serde_json::from_str(&mock.generate_requests()[0].body).unwrap();
+    assert_eq!(
+        body["params"]["system"], "be terse",
+        "Anthropic 顶层 system 必须折成上游的字符串 system（PROTOCOL.md #1）"
+    );
+    assert_eq!(body["params"]["tools"][0]["name"], "read_file");
+    assert_eq!(body["params"]["tools"][0]["input_schema"]["type"], "object");
 }

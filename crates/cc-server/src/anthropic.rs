@@ -2161,6 +2161,57 @@ mod tests {
     }
 
     #[test]
+    fn converted_request_survives_the_second_stage_into_the_generate_body() {
+        // 两段式转换的接缝：anthropic_to_openai 的产物必须能被 convert.rs 直接消费，
+        // 并且保留 PROTOCOL.md #1（system 是字符串）与 #2（reasoning 最前）两条硬约束。
+        let req = json!({
+            "model": "deepseek/deepseek-v4-flash",
+            "max_tokens": 2048,
+            "system": [
+                { "type": "text", "text": "系统甲" },
+                { "type": "text", "text": "系统乙" }
+            ],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        { "type": "thinking", "thinking": "先想" },
+                        { "type": "text", "text": "再答" },
+                        { "type": "tool_use", "id": "t1", "name": "f", "input": {} }
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [{ "type": "tool_result", "tool_use_id": "t1", "content": "结果" }]
+                }
+            ]
+        });
+        let openai = anthropic_to_openai(&req).expect("第一段转换应成功");
+        let body = crate::convert::build_generate_body(&openai, &crate::config::Config::default())
+            .expect("第二段转换应成功");
+        assert!(
+            body["params"]["system"].is_string(),
+            "PROTOCOL.md #1：跨两段转换后 params.system 仍必须是字符串"
+        );
+        assert_eq!(body["params"]["system"], "系统甲\n系统乙");
+        // messages[0] 是 system（上一步的断言），assistant 是 messages[1]
+        let blocks = body["params"]["messages"][1]["content"]
+            .as_array()
+            .expect("assistant 的 content 必须是数组");
+        assert_eq!(
+            blocks[0]["type"], "reasoning",
+            "PROTOCOL.md #2：reasoning 必须保持在内容块数组最前"
+        );
+        assert_eq!(blocks[1]["type"], "text");
+        assert_eq!(blocks[2]["type"], "tool-call");
+        assert_eq!(blocks[2]["toolCallId"], "t1");
+        assert_eq!(
+            body["params"]["max_tokens"], 2048,
+            "max_tokens 应原样带过去"
+        );
+    }
+
+    #[test]
     fn sse_event_serialization_uses_the_wire_format() {
         let mut builder = AnthropicSseBuilder::new("msg_1", "m");
         let events = builder.push(&UpstreamEvent::TextDelta("hi".into()));

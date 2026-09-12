@@ -25,7 +25,7 @@ use axum::Router;
 use bytes::Bytes;
 use serde_json::{json, Value};
 
-use crate::config::{Config, UpstreamProtocol};
+use crate::config::{Config, PublicProtocol, UpstreamProtocol};
 use crate::convert::{build_generate_body_with_context, GenerateContext};
 use crate::error::{CcError, ErrorEnvelope};
 use crate::openai::{build_completion, to_sse_line, ChunkBuilder, SSE_DONE};
@@ -171,6 +171,7 @@ pub fn router(state: Arc<ProxyState>) -> Router {
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/messages", post(messages))
         .with_state(state)
 }
 
@@ -236,7 +237,6 @@ async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let started = now_ms();
     let request: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(e) => {
@@ -246,6 +246,51 @@ async fn chat_completions(
             );
         }
     };
+    // OpenAI 形状直接进入统一生成流程
+    run_generation(state, headers, request, PublicProtocol::OpenAi).await
+}
+
+/// 入口：Anthropic 兼容的 messages。
+///
+/// 先把 Anthropic 请求转成 OpenAI 形状（复用 [crate::anthropic::anthropic_to_openai]），
+/// 之后与 [chat_completions] 走**完全同一条**生成流程——账号轮换、错误语义、
+/// 用量统计都只有一份实现。
+async fn messages(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let incoming: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                &CcError::Protocol(format!("请求体不是合法 JSON：{e}")),
+                ErrorEnvelope::Anthropic,
+            );
+        }
+    };
+    let request = match crate::anthropic::anthropic_to_openai(&incoming) {
+        Ok(converted) => converted,
+        Err(e) => return error_response(&e, ErrorEnvelope::Anthropic),
+    };
+    run_generation(state, headers, request, PublicProtocol::Anthropic).await
+}
+
+/// 统一的生成流程（两种对外协议共用）。
+///
+/// public 决定**响应的编码形状**（OpenAI SSE / Anthropic SSE），
+/// 而请求体在进入本函数前已经统一成 OpenAI 形状。
+async fn run_generation(
+    state: Arc<ProxyState>,
+    headers: HeaderMap,
+    request: Value,
+    public: PublicProtocol,
+) -> Response {
+    let envelope = match public {
+        PublicProtocol::OpenAi => ErrorEnvelope::OpenAi,
+        PublicProtocol::Anthropic => ErrorEnvelope::Anthropic,
+    };
+    let started = now_ms();
 
     let model = request
         .get("model")
@@ -263,7 +308,7 @@ async fn chat_completions(
     // 上游只有流式接口；非流式请求由本地缓冲后一次性返回
     let first = match state.select_account(&model) {
         Ok(account) => account,
-        Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+        Err(e) => return error_response(&e, envelope),
     };
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
@@ -291,7 +336,7 @@ async fn chat_completions(
         let generate_body =
             match build_generate_body_with_context(&request, &state.config, &context) {
                 Ok(b) => b,
-                Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+                Err(e) => return error_response(&e, envelope),
             };
 
         // 指纹预请求是尽力而为的，失败不影响对话
@@ -367,7 +412,7 @@ async fn chat_completions(
                         ttft_ms,
                         started,
                     );
-                    return error_response(&final_error, ErrorEnvelope::OpenAi);
+                    return error_response(&final_error, envelope);
                 }
                 RotationStep::NotRotatable => {
                     record(
@@ -382,7 +427,7 @@ async fn chat_completions(
                         ttft_ms,
                         started,
                     );
-                    return error_response(&error, ErrorEnvelope::OpenAi);
+                    return error_response(&error, envelope);
                 }
             }
         }
@@ -420,23 +465,36 @@ async fn chat_completions(
                             ttft_ms,
                             started,
                         );
-                        return error_response(&e, ErrorEnvelope::OpenAi);
+                        return error_response(&e, envelope);
                     }
                 }
             }
             if let Some(u) = events.usage() {
                 usage_totals.add(u);
             }
-            let body = build_completion(
-                &completion_id,
-                created,
-                &model,
-                &content,
-                &reasoning,
-                &tool_calls,
-                &finish,
-                events.usage(),
-            );
+            // 按对外协议选择响应形状：请求体早已统一成 OpenAI 形状，
+            // 只有**响应编码**需要区分（Anthropic 客户端认不得 OpenAI 的 JSON）。
+            let body = match public {
+                PublicProtocol::OpenAi => build_completion(
+                    &completion_id,
+                    created,
+                    &model,
+                    &content,
+                    &reasoning,
+                    &tool_calls,
+                    &finish,
+                    events.usage(),
+                ),
+                PublicProtocol::Anthropic => crate::anthropic::build_anthropic_response(
+                    &completion_id,
+                    &model,
+                    &content,
+                    &reasoning,
+                    &tool_calls,
+                    &finish,
+                    events.usage(),
+                ),
+            };
             let record_ok = RequestRecord {
                 at_ms: now_ms(),
                 account_id: current.slot.id.clone(),
@@ -457,7 +515,10 @@ async fn chat_completions(
         }
 
         // 流式：把事件流翻译成 SSE
-        let mut builder = ChunkBuilder::new(completion_id.clone(), created, model.clone());
+        // 两种协议各有一个有状态编码器；请求体已统一，这里只决定 SSE 形状。
+        let mut openai_builder = ChunkBuilder::new(completion_id.clone(), created, model.clone());
+        let mut anthropic_builder =
+            crate::anthropic::AnthropicSseBuilder::new(completion_id.clone(), model.clone());
         let stream_state = state.clone();
         let account = current.clone();
         let protocol_name = protocol_name(protocol);
@@ -473,8 +534,21 @@ async fn chat_completions(
                             ttft_ms = Some(now_ms() - started);
                         }
                         saw_any = true;
-                        for chunk in builder.push(&event) {
-                            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(to_sse_line(&chunk)));
+                        match public {
+                            PublicProtocol::OpenAi => {
+                                for chunk in openai_builder.push(&event) {
+                                    yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                                        to_sse_line(&chunk),
+                                    ));
+                                }
+                            }
+                            PublicProtocol::Anthropic => {
+                                for sse in anthropic_builder.push(&event) {
+                                    yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                                        sse.to_sse(),
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -483,7 +557,11 @@ async fn chat_completions(
                         let payload = json!({
                             "error": { "message": e.to_string(), "type": e.code() }
                         });
-                        yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                        yield Ok(Bytes::from(match public {
+                            PublicProtocol::OpenAi => format!("data: {payload}\n\n"),
+                            // Anthropic 客户端按 event/data 两行解析，错误也要带 event 名
+                            PublicProtocol::Anthropic => format!("event: error\ndata: {payload}\n\n"),
+                        }));
                         let rec = RequestRecord {
                             at_ms: now_ms(),
                             account_id: account.slot.id.clone(),
@@ -512,9 +590,23 @@ async fn chat_completions(
                 let payload = json!({
                     "error": { "message": e.to_string(), "type": e.code() }
                 });
-                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                yield Ok(Bytes::from(match public {
+                    PublicProtocol::OpenAi => format!("data: {payload}\n\n"),
+                    // Anthropic 客户端按 event/data 两行解析，错误也要带 event 名
+                    PublicProtocol::Anthropic => format!("event: error\ndata: {payload}\n\n"),
+                }));
             }
-            yield Ok(Bytes::from(SSE_DONE));
+            match public {
+                PublicProtocol::OpenAi => yield Ok(Bytes::from(SSE_DONE)),
+                PublicProtocol::Anthropic => {
+                    // Anthropic 的收尾序列（content_block_stop → message_delta →
+                    // message_stop）由 builder.finish() 统一发出。**必须调用它**：
+                    // 否则客户端状态机会一直等待（表现为「答完了界面还在转圈」）。
+                    for sse in anthropic_builder.finish() {
+                        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(sse.to_sse()));
+                    }
+                }
+            }
             let rec = RequestRecord {
                 at_ms: now_ms(),
                 account_id: account.slot.id.clone(),
@@ -557,7 +649,7 @@ async fn chat_completions(
         ttft_ms,
         started,
     );
-    error_response(&error, ErrorEnvelope::OpenAi)
+    error_response(&error, envelope)
 }
 
 /// 解析下一个候选账号（不含已试过的）。
