@@ -252,6 +252,7 @@ pub fn router(state: Arc<ProxyState>) -> Router {
         .route("/v1/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
+        .route("/v1/v1/responses", post(responses))
         .with_state(state)
 }
 
@@ -327,6 +328,24 @@ async fn chat_completions(
             );
         }
     };
+    // 智能嗅探：若带有 anthropic-version 请求头，说明客户端误将 Anthropic Base URL 配置到了 /v1/chat/completions
+    if headers.contains_key("anthropic-version") {
+        let converted = match crate::anthropic::anthropic_to_openai(&request) {
+            Ok(c) => c,
+            Err(e) => return error_response(&e, ErrorEnvelope::Anthropic),
+        };
+        return run_generation(state, headers, converted, PublicProtocol::Anthropic).await;
+    }
+
+    // 智能嗅探：若请求体包含 input 且无 messages，说明客户端以 Responses API 结构发送至此
+    if request.get("input").is_some() && request.get("messages").is_none() {
+        let converted = match crate::responses::convert_responses_to_chat(&request) {
+            Ok(c) => c,
+            Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+        };
+        return run_generation(state, headers, converted, PublicProtocol::Responses).await;
+    }
+
     // OpenAI 形状直接进入统一生成流程
     run_generation(state, headers, request, PublicProtocol::OpenAi).await
 }

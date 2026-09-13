@@ -63,3 +63,31 @@
 **验证与交付**
 - 执行 `./scripts/check.sh`：260 项核心单测、18 项端到端轮转测试、Clippy 零警告、TypeScript 及 Vite 打包全部通过。
 - 执行 `pnpm tauri build --bundles app` 完成生产构建并部署覆盖 `/Applications/Command Code.app` 启动运行。
+
+## 2026-09-13 · 额度单位补充、客户端协议精准识别与独特应用图标重构
+
+**当前目标**：
+1. 解决账号用量面板缺少单位提示的问题（已用及额度增加 `$`）；
+2. 彻底修复客户端协议识别问题（Responses API 输入容错、多级 Base URL 容错路由与智能协议特征嗅探，确保 OpenAI Chat、Anthropic、Responses 精准分类记录）；
+3. 重新设计完全独特的 macOS 应用图标（摆脱同质化的终端 `> _` 风格，融合 Apple Command 键 ⌘ 与量子多环轮转）；
+4. 保持项目进度与交付日志实时更新。
+
+**实施变更**
+- **额度展示与货币单位**：
+  - `src/components/AccountCard.tsx`：引入 `fmtMoney` 格式化函数，用量进度条展示为 `已用 $X / $Y`、`剩余 $Z`；在月度剩余、充值余额、免费额度中统一补充 `$` 单位提示，消除数值歧义。
+- **协议兼容与识别引擎**：
+  - `crates/cc-server/src/responses.rs`：重构 `convert_responses_to_chat` 针对 `input` 数组项的解析逻辑，兼容缺少 `type: "message"` 但带 `role` 的消息对象及纯字符串项，杜绝 502 `input is required` 报错。
+  - `crates/cc-server/src/proxy.rs`：
+    - 路由增加 `/v1/v1/responses` 容错路径，适配各 SDK 在 Base URL 后级联追加的场景；
+    - 在 `chat_completions` 网关入口增加智能嗅探：若检测到 `anthropic-version` 请求头则智能转发至 Anthropic 管线；若检测到 `input` 且无 `messages` 则自动转换为 Responses 管线并标记正确协议。
+  - `crates/cc-server/tests/e2e_rotation.rs`：新增 `client_protocol_is_accurately_recorded_for_all_protocols` 端到端测试，全面覆盖 OpenAI Chat、Anthropic、Responses、容错路由及智能嗅探 6 种场景。
+- **独特视觉图标重构**：
+  - `scripts/generate_icon.py`：使用超采样纯几何布尔掩模算法（CSG）生成完美正切圆角、零瑕疵接缝的 Apple Command 键（⌘）与外围量子能量光环，中心嵌入高亮能量星核；
+  - 重新渲染并输出全部规格：`icon-1024.png`、`icon.png` (512x512)、`128x128@2x.png` (256x256)、`128x128.png`、`32x32.png`，并通过 `iconutil` 生成最新 `icon.icns` 与 `Command Code.icns`。
+
+**验证与交付**
+- 执行 Rust 单测与端到端集成测试，6 种协议流转测试全部通过；
+- 执行 `./scripts/check.sh`：代码格式、Clippy、Cargo Deny、TypeScript 及 Vite 前端打包全绿；
+- 执行 `pnpm tauri build --bundles app` 完成桌面端 Release 打包；
+- 部署覆盖至 `/Applications/Command Code.app`，刷新 macOS LaunchServices 图标缓存并重启运行。
+

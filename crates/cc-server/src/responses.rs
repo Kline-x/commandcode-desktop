@@ -217,7 +217,46 @@ pub fn convert_responses_to_chat(resp_req: &Value) -> Result<Value, CcError> {
                                 "content": content
                             }));
                         }
-                        _ => {}
+                        _ => {
+                            // 容错：许多客户端（包括 OpenAI Responses 官方 SDK 或直接 curl）
+                            // 发送的 input 数组项不带 type: "message"，但包含 role 与 content，或者为纯字符串
+                            if let Some(s) = item.as_str() {
+                                flush_pending(&mut messages, &mut pending);
+                                messages.push(json!({
+                                    "role": "user",
+                                    "content": s
+                                }));
+                            } else if let Some(role) = item.get("role").and_then(Value::as_str) {
+                                let content_val = item.get("content").unwrap_or(&Value::Null);
+                                let text = responses_text_of(content_val);
+                                if role == "assistant" {
+                                    if !text.is_empty() {
+                                        pending.content = Some(text);
+                                    }
+                                } else if role == "system" || role == "developer" {
+                                    flush_pending(&mut messages, &mut pending);
+                                    messages.push(json!({
+                                        "role": "system",
+                                        "content": text
+                                    }));
+                                } else {
+                                    flush_pending(&mut messages, &mut pending);
+                                    messages.push(json!({
+                                        "role": "user",
+                                        "content": text
+                                    }));
+                                }
+                            } else if let Some(content_val) = item.get("content") {
+                                let text = responses_text_of(content_val);
+                                if !text.is_empty() {
+                                    flush_pending(&mut messages, &mut pending);
+                                    messages.push(json!({
+                                        "role": "user",
+                                        "content": text
+                                    }));
+                                }
+                            }
+                        }
                     }
                 }
             }
