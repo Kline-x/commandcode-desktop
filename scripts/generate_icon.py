@@ -230,6 +230,10 @@ def main():
         resized.save(out_path, "PNG")
         print(f"  ✓ Generated {name} ({w}x{h})")
         
+    ico_path = os.path.join(icons_dir, "icon.ico")
+    master.save(ico_path, sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+    print(f"  ✓ Generated icon.ico for Windows")
+
     with tempfile.TemporaryDirectory() as tmpdir:
         iconset_dir = os.path.join(tmpdir, "icons.iconset")
         os.makedirs(iconset_dir, exist_ok=True)
