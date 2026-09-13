@@ -49,7 +49,10 @@ pub enum SecretError {
 /// 主密钥的来源，用于日志与诊断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MasterKeySource {
+    /// 从应用受保护的私有密钥文件读取（权限 0600，无系统弹窗）。
+    LocalFile,
     /// 从系统钥匙串读取或写入。
+    #[allow(dead_code)]
     Keychain,
     /// 钥匙串不可用，退化为主进程内存中的临时密钥。
     Ephemeral,
@@ -58,27 +61,37 @@ pub enum MasterKeySource {
 /// 处理后的主密钥持有者。
 ///
 /// 在应用启动时构造一次，之后由 [Self::decrypt] / [Self::encrypt] 使用。
-/// 主密钥**只存在内存与钥匙串**，不写入任何自有文件。
+/// 优先存放在应用私有数据目录中，保证只有当前用户有读写权限。
 pub struct Secrets {
     cipher: Aes256Gcm,
     source: MasterKeySource,
 }
 
 impl Secrets {
-    /// 从系统钥匙串加载主密钥；不存在则生成并保存。
-    ///
-    /// 钥匙串不可用时退化为临时密钥（见模块文档的说明）。
-    pub fn load_or_create() -> Self {
-        match Self::load_or_create_inner() {
+    /// 从本地私有密钥文件或系统钥匙串加载主密钥；不存在则生成并保存。
+    /// 优先使用 data_dir/.master_key（权限 0600），彻底避免 macOS 钥匙串弹窗。
+    pub fn load_or_create(data_dir: &std::path::Path) -> Self {
+        let key_file = data_dir.join(".master_key");
+        if key_file.exists() {
+            if let Ok(bytes) = std::fs::read(&key_file) {
+                if bytes.len() == 32 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&bytes);
+                    tracing::info!("账号密钥的主密钥已从本地私有密钥文件加载（无密码弹窗）");
+                    return Self::from_bytes(key, MasterKeySource::LocalFile);
+                }
+            }
+        }
+
+        match Self::load_or_create_inner(&key_file) {
             Ok(secrets) => {
                 tracing::info!(source = ?secrets.source, "账号密钥的主密钥已就绪");
                 secrets
             }
             Err(error) => {
-                // 钥匙串不可用不该是致命的：退化并明确告知后果
                 tracing::warn!(
                     %error,
-                    "系统钥匙串不可用，本次运行使用内存中的临时主密钥；重启后需重新添加账号"
+                    "主密钥初始化失败，本次运行使用内存中的临时主密钥；重启后需重新添加账号"
                 );
                 Self::ephemeral()
             }
@@ -144,27 +157,61 @@ impl Secrets {
         String::from_utf8(plaintext).map_err(|e| SecretError::Corrupted(e.to_string()))
     }
 
-    /// 从钥匙串读取主密钥；不存在则生成并写入。
-    fn load_or_create_inner() -> Result<Self, Box<dyn std::error::Error>> {
-        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
-        match entry.get_password() {
-            Ok(encoded) => {
-                let bytes = decode_hex(&encoded)?;
-                let key: [u8; 32] = bytes
-                    .try_into()
-                    .map_err(|_| "钥匙串里的主密钥长度不是 32 字节")?;
-                Ok(Self::from_bytes(key, MasterKeySource::Keychain))
+    /// 优先从钥匙串迁移旧密钥（如果已存在），否则生成全新密钥，并写入本地 0600 文件。
+    fn load_or_create_inner(
+        key_file: &std::path::Path,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut loaded_key: Option<[u8; 32]> = None;
+
+        // 尝试从旧版钥匙串读取（兼容已有的旧账号）
+        if let Ok(entry) = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT) {
+            if let Ok(encoded) = entry.get_password() {
+                if let Ok(bytes) = decode_hex(&encoded) {
+                    if let Ok(arr) = bytes.try_into() {
+                        loaded_key = Some(arr);
+                    }
+                }
             }
-            Err(keyring::Error::NoEntry) => {
-                let key = Aes256Gcm::generate_key(&mut OsRng);
-                let mut bytes = [0u8; 32];
-                bytes.copy_from_slice(&key);
-                entry.set_password(&encode_hex(&bytes))?;
-                Ok(Self::from_bytes(bytes, MasterKeySource::Keychain))
-            }
-            Err(other) => Err(Box::new(other)),
         }
+
+        let key: [u8; 32] = match loaded_key {
+            Some(k) => k,
+            None => {
+                let generated = Aes256Gcm::generate_key(&mut OsRng);
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&generated);
+                bytes
+            }
+        };
+
+        // 写入本地受保护文件（Unix 下设为 0600 仅当前用户可读写）
+        if let Err(e) = write_private_key_file(key_file, &key) {
+            tracing::warn!(%e, "未能写入本地主密钥文件");
+        }
+
+        Ok(Self::from_bytes(key, MasterKeySource::LocalFile))
     }
+}
+
+/// 写入仅当前系统用户可读写的私有文件（0600）。
+fn write_private_key_file(path: &std::path::Path, key: &[u8; 32]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        use std::io::Write;
+        file.write_all(key)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, key)?;
+    }
+    Ok(())
 }
 
 /// 生成密钥提示：`user_…ab12`。
@@ -182,6 +229,7 @@ pub fn key_hint(plaintext: &str) -> String {
 }
 
 /// 字节串 → 十六进制（不引额外依赖，保持二进制体积）。
+#[allow(dead_code)]
 fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

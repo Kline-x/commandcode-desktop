@@ -133,6 +133,88 @@ button:disabled {
   color: var(--err);
 }
 
+/* 把按钮伪装成链接：表格里的「展开」是导航类操作，不该像主操作那样显眼 */
+.link {
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 0;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.link:hover {
+  color: var(--accent);
+}
+
+.quota-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 10px 4px;
+}
+
+.quota-card__plan {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.quota__head {
+  display: flex;
+  justify-content: space-between;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.quota__label {
+  color: var(--muted);
+}
+
+.quota__value {
+  font-variant-numeric: tabular-nums;
+}
+
+.quota__exceeded {
+  color: var(--err);
+}
+
+.quota__track {
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.quota__bar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+/* 色阶与参考面板一致：50% 黄 / 75% 橙 / 90% 红 */
+.quota__bar--low {
+  background: var(--ok);
+}
+.quota__bar--mid {
+  background: var(--warn);
+}
+.quota__bar--high {
+  background: #db6d28;
+}
+.quota__bar--danger {
+  background: var(--err);
+}
+
+.quota__hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.quota__hint--err {
+  color: var(--err);
+}
+
 .notice {
   border-radius: 6px;
   padding: 10px 12px;

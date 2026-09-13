@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { addAccount, sendJson } from "../lib/api";
+import { QuotaCard } from "./QuotaBar";
 
 /** 一个账号在控制面上的形状。 */
 interface AccountView {
@@ -26,6 +27,8 @@ export function AccountsPanel(): React.JSX.Element {
 
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
+  // 展开查看配额的账号 id（点名称切换）
+  const [expanded, setExpanded] = useState<number | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -142,7 +145,16 @@ export function AccountsPanel(): React.JSX.Element {
           <tbody>
             {accounts.map((account) => (
               <tr key={account.id}>
-                <td>{account.label}</td>
+                <td>
+                  {/* 点名称展开配额：配额数据较宽，塞进表格列会挤坏其他列 */}
+                  <button
+                    type="button"
+                    className="link"
+                    onClick={() => setExpanded(expanded === account.id ? null : account.id)}
+                  >
+                    {expanded === account.id ? "▾" : "▸"} {account.label}
+                  </button>
+                </td>
                 <td>{account.key_hint}</td>
                 <td>
                   {account.last_error ?? (account.enabled ? "可用" : "已停用")}
@@ -161,6 +173,13 @@ export function AccountsPanel(): React.JSX.Element {
                 </td>
               </tr>
             ))}
+            {expanded !== null && (
+              <tr>
+                <td colSpan={4}>
+                  <QuotaCard quota={accounts.find((a) => a.id === expanded)?.quota} />
+                </td>
+              </tr>
+            )}
           </tbody>
         </table>
       )}

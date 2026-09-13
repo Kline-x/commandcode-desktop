@@ -135,7 +135,7 @@ pub fn start(
     // 注意：**密文的解密在宿主层**（见 secrets.rs），本模块只做接线。
     let slots = load_slots(&store);
     // 主密钥在这里加载一次，之后由 AppState 与 IPC 命令共享
-    let secrets = Arc::new(crate::secrets::Secrets::load_or_create());
+    let secrets = Arc::new(crate::secrets::Secrets::load_or_create(&data_dir));
     if secrets.source() == crate::secrets::MasterKeySource::Ephemeral {
         tracing::warn!("本次运行使用临时主密钥：重启后需重新添加账号");
     }
