@@ -19,6 +19,8 @@ pub struct AppState {
     pub proxy_base_url: String,
     /// 数据库路径（用于「打开数据目录」菜单）。
     pub data_dir: std::path::PathBuf,
+    /// 配额轮询的停机信号发送端（进程退出时置真）。
+    pub quota_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// 启动应用。

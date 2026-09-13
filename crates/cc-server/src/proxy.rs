@@ -75,7 +75,9 @@ pub struct ProxyState {
     /// 配置。
     pub config: Config,
     /// 上游客户端。
-    pub upstream: UpstreamClient,
+    ///
+    /// 用 Arc 持有：配额轮询器要共享同一个实例（会话/指纹状态才能一致）。
+    pub upstream: Arc<UpstreamClient>,
     /// 账号池（轮换状态）。
     pub pool: std::sync::Mutex<AccountPool>,
     /// 槽位列表（配置层事实）。
@@ -100,7 +102,7 @@ impl ProxyState {
         let upstream = UpstreamClient::new(config.clone())?;
         Ok(Self {
             config,
-            upstream,
+            upstream: Arc::new(upstream),
             pool: std::sync::Mutex::new(AccountPool::new()),
             slots,
             resolve_key,
@@ -308,7 +310,31 @@ async fn run_generation(
     // 上游只有流式接口；非流式请求由本地缓冲后一次性返回
     let first = match state.select_account(&model) {
         Ok(account) => account,
-        Err(e) => return error_response(&e, envelope),
+        Err(e) => {
+            // 没有可用账号也要记一条流水：这是首次使用时最常见的状态，
+            // 面板上什么都不显示会让用户以为程序坏了。
+            let placeholder = ResolvedAccount {
+                slot: AccountSlot {
+                    id: "(无账号)".to_string(),
+                    label: String::new(),
+                },
+                key: String::new(),
+                state: None,
+            };
+            record(
+                &state,
+                &placeholder,
+                &model,
+                UpstreamProtocol::Auto,
+                stream,
+                &e,
+                &UsageTotals::default(),
+                1,
+                None,
+                started,
+            );
+            return error_response(&e, envelope);
+        }
     };
 
     let completion_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());

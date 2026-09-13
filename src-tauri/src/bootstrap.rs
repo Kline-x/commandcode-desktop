@@ -5,6 +5,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::sync::Arc;
+use std::time::Duration;
 
 use cc_server::control::{control_router, ControlState};
 use cc_server::proxy::{router as proxy_router, KeyResolver, ProxyState};
@@ -87,6 +88,33 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
         Arc::new(move |slot: &cc_server::AccountSlot| map.get(&slot.id).cloned())
     };
 
+    // ---- 请求落库：把代理的每次请求写进 SQLite，面板据此展示流水 ----
+    //
+    // observer 是同步回调（代理路径上不能 await 数据库），所以这里只做一次
+    // 快速 insert；SQLite 单写者模型下每次请求一行，成本可忽略。
+    let store_for_records = store.clone();
+    let observer: cc_server::RequestObserver = Arc::new(move |record| {
+        let row = cc_server::store::NewRequest {
+            at_ms: record.at_ms,
+            account_id: record.account_id.clone(),
+            model: record.model.clone(),
+            protocol: record.protocol.to_string(),
+            stream: record.stream,
+            status: record.status,
+            error_code: record.error_code.clone(),
+            input_tokens: record.usage.input_tokens as i64,
+            output_tokens: record.usage.output_tokens as i64,
+            cached_tokens: record.usage.cached_input_tokens as i64,
+            ttft_ms: record.ttft_ms,
+            total_ms: record.total_ms,
+            attempts: record.attempts as i64,
+        };
+        if let Err(error) = store_for_records.insert_request(&row) {
+            // 落库失败不能影响已经完成的请求；记日志即可
+            tracing::warn!(%error, "请求流水写入失败");
+        }
+    });
+
     let config = Config {
         api_base: "https://api.commandcode.ai".to_string(),
         // Auto：先 Provider API，遇 upgrade_required 降级到 CLI（Go 套餐可用）
@@ -94,9 +122,19 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
         ..Config::default()
     };
     let proxy_state = Arc::new(
-        ProxyState::new(config, slots, resolve_key)
-            .map_err(|e| StartupError::Core(e.to_string()))?,
+        ProxyState::new(config.clone(), slots.clone(), Arc::clone(&resolve_key))
+            .map_err(|e| StartupError::Core(e.to_string()))?
+            // observer 必须先挂上：它负责把每次请求写进 SQLite（面板的流水来源）
+            .with_observer(observer),
     );
+    // ---- 配额轮询：周期拉各账号的用量窗口，供面板展示 ----
+    let poller = Arc::new(cc_server::quota_poller::QuotaPoller::new(
+        config.clone(),
+        Arc::clone(&proxy_state.upstream),
+        Duration::from_millis(cc_server::quota_poller::DEFAULT_INTERVAL_MS),
+    ));
+    poller.set_accounts(&slots, &resolve_key);
+
     let proxy_app = proxy_router(proxy_state);
 
     let control_url = format!("http://{control_addr}");
@@ -121,6 +159,15 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
             Err(error) => tracing::error!(%error, "控制面无法启动"),
         }
     });
+    // 配额轮询：周期拉各账号的用量窗口（面板的数据来源）。
+    // 用 watch 通道做停机信号——它适合表达「状态」，broadcast 适合「事件」。
+    let (quota_shutdown, quota_shutdown_rx) = tokio::sync::watch::channel(false);
+    let poller_task = Arc::clone(&poller);
+    tauri::async_runtime::spawn(async move {
+        poller_task.run(quota_shutdown_rx).await;
+        tracing::debug!("配额轮询已停止");
+    });
+
     tauri::async_runtime::spawn(async move {
         match to_tokio_listener(proxy_listener, proxy_addr) {
             Ok(listener) => {
@@ -140,6 +187,7 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
             control_token,
             proxy_base_url: proxy_url,
             data_dir,
+            quota_shutdown,
         },
         store,
     ))
