@@ -99,7 +99,5 @@ jobs:
           name: bundle-${{ matrix.target }}
           path: |
             target/${{ matrix.target }}/release/bundle/**
-            src-tauri/target/${{ matrix.target }}/release/bundle/**
-          if-no-files-found: warn
           if-no-files-found: warn
           retention-days: 14
