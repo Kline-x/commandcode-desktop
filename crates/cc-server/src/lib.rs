@@ -32,6 +32,7 @@ pub mod pool;
 pub mod proxy;
 pub mod quota;
 pub mod quota_poller;
+pub mod responses;
 pub mod sse;
 pub mod store;
 pub mod time;
@@ -63,6 +64,7 @@ pub use quota::{
 pub use quota_poller::{
     QuotaFetchError, QuotaPoller, QuotaUpdate, DEFAULT_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS,
 };
+pub use responses::{build_responses_object, convert_responses_to_chat, ResponsesSseBuilder};
 pub use sse::{LineBuffer, UpstreamEvent, Usage};
 pub use store::{AccountRow, NewRequest, RequestRow, RouteRuleRow, Store, SCHEMA_VERSION};
 pub use time::{civil_from_days, date_string, format_epoch_ms};

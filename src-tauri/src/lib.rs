@@ -61,6 +61,9 @@ pub struct AppState {
     pub quota_shutdown: tokio::sync::watch::Sender<bool>,
 }
 
+/// 全局崩溃转储路径（启动后由 bootstrap 注入）。
+pub static CRASH_LOG_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
 /// 启动应用。
 pub fn run() {
     let log_buffer = get_log_buffer();
@@ -73,6 +76,33 @@ pub fn run() {
         )
         .with_writer(tee)
         .init();
+
+    // 崩溃捕获与转储（Phase 4）：捕获未处理 panic 并持久化到 crash.log
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let payload = if let Some(s) = panic_info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = panic_info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "未知 panic 信息".to_string()
+        };
+        let location = panic_info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "未知位置".to_string());
+        let now_str = cc_server::format_epoch_ms(cc_server::time::now_epoch_ms());
+        let crash_msg = format!(
+            "=== COMMAND CODE CRASH REPORT ===\n时间: {now_str}\n位置: {location}\n原因: {payload}\n=================================\n"
+        );
+        eprintln!("{crash_msg}");
+        let log_buf = get_log_buffer();
+        log_buf.push("ERROR", crash_msg.clone());
+        if let Some(path) = CRASH_LOG_PATH.get() {
+            let _ = std::fs::write(path, &crash_msg);
+        }
+        default_hook(panic_info);
+    }));
 
     // 单实例：第二次启动时把已有窗口带到前台，而不是起第二个代理
     //（两个代理抢同一个端口会有一个静默失败，用户看到的却是「没反应」）。

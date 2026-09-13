@@ -122,6 +122,21 @@ pub fn start(
     let data_dir = data_dir(app)?;
     std::fs::create_dir_all(&data_dir).map_err(|e| StartupError::DataDir(e.to_string()))?;
 
+    let crash_file = data_dir.join("crash.log");
+    let _ = crate::CRASH_LOG_PATH.set(crash_file.clone());
+    if crash_file.exists() {
+        if let Ok(content) = std::fs::read_to_string(&crash_file) {
+            tracing::warn!(
+                crash_log = %crash_file.display(),
+                "检测到上次运行的崩溃日志 (crash.log)"
+            );
+            crate::get_log_buffer().push(
+                "WARN",
+                format!("[CRASH RECOVERY] 检测到上次运行崩溃日志:\n{content}"),
+            );
+        }
+    }
+
     let db_path = data_dir.join("commandcode.db");
     // 保留最近 5000 条流水：足够面板回溯，又不会让数据库无限增长
     let store =

@@ -182,6 +182,7 @@ pub fn router(state: Arc<ProxyState>) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/v1/responses", post(responses))
         .with_state(state)
 }
 
@@ -287,9 +288,34 @@ async fn messages(
     run_generation(state, headers, request, PublicProtocol::Anthropic).await
 }
 
-/// 统一的生成流程（两种对外协议共用）。
+/// 入口：OpenAI Responses API（/v1/responses）。
 ///
-/// public 决定**响应的编码形状**（OpenAI SSE / Anthropic SSE），
+/// 供 Codex 等使用 Responses 协议的客户端接入。代理作为无状态转换层：
+/// 把 input 翻译成内部 Chat 格式，复用同一套 CC 转发管线。
+async fn responses(
+    State(state): State<Arc<ProxyState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let incoming: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                &CcError::Protocol(format!("请求体不是合法 JSON：{e}")),
+                ErrorEnvelope::OpenAi,
+            );
+        }
+    };
+    let request = match crate::responses::convert_responses_to_chat(&incoming) {
+        Ok(converted) => converted,
+        Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+    };
+    run_generation(state, headers, request, PublicProtocol::Responses).await
+}
+
+/// 统一的生成流程（三种对外协议共用）。
+///
+/// public 决定**响应的编码形状**（OpenAI SSE / Anthropic SSE / Responses SSE），
 /// 而请求体在进入本函数前已经统一成 OpenAI 形状。
 async fn run_generation(
     state: Arc<ProxyState>,
@@ -298,7 +324,7 @@ async fn run_generation(
     public: PublicProtocol,
 ) -> Response {
     let envelope = match public {
-        PublicProtocol::OpenAi => ErrorEnvelope::OpenAi,
+        PublicProtocol::OpenAi | PublicProtocol::Responses => ErrorEnvelope::OpenAi,
         PublicProtocol::Anthropic => ErrorEnvelope::Anthropic,
     };
     let started = now_ms();
@@ -529,6 +555,16 @@ async fn run_generation(
                     &finish,
                     events.usage(),
                 ),
+                PublicProtocol::Responses => crate::responses::build_responses_object(
+                    &completion_id,
+                    &model,
+                    created,
+                    &content,
+                    &reasoning,
+                    &tool_calls,
+                    &finish,
+                    events.usage().as_ref(),
+                ),
             };
             let record_ok = RequestRecord {
                 at_ms: now_ms(),
@@ -550,10 +586,15 @@ async fn run_generation(
         }
 
         // 流式：把事件流翻译成 SSE
-        // 两种协议各有一个有状态编码器；请求体已统一，这里只决定 SSE 形状。
+        // 三种协议各有一个有状态编码器；请求体已统一，这里只决定 SSE 形状。
         let mut openai_builder = ChunkBuilder::new(completion_id.clone(), created, model.clone());
         let mut anthropic_builder =
             crate::anthropic::AnthropicSseBuilder::new(completion_id.clone(), model.clone());
+        let mut responses_builder = crate::responses::ResponsesSseBuilder::new(
+            completion_id.clone(),
+            created,
+            model.clone(),
+        );
         let stream_state = state.clone();
         let account = current.clone();
         let protocol_name = protocol_name(protocol);
@@ -584,6 +625,13 @@ async fn run_generation(
                                     ));
                                 }
                             }
+                            PublicProtocol::Responses => {
+                                for sse in responses_builder.push(&event) {
+                                    yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                                        sse,
+                                    ));
+                                }
+                            }
                         }
                     }
                     Ok(None) => break,
@@ -592,11 +640,19 @@ async fn run_generation(
                         let payload = json!({
                             "error": { "message": e.to_string(), "type": e.code() }
                         });
-                        yield Ok(Bytes::from(match public {
-                            PublicProtocol::OpenAi => format!("data: {payload}\n\n"),
-                            // Anthropic 客户端按 event/data 两行解析，错误也要带 event 名
-                            PublicProtocol::Anthropic => format!("event: error\ndata: {payload}\n\n"),
-                        }));
+                        match public {
+                            PublicProtocol::OpenAi => {
+                                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                            }
+                            PublicProtocol::Anthropic => {
+                                yield Ok(Bytes::from(format!("event: error\ndata: {payload}\n\n")));
+                            }
+                            PublicProtocol::Responses => {
+                                for sse in responses_builder.fail(&e.to_string()) {
+                                    yield Ok(Bytes::from(sse));
+                                }
+                            }
+                        }
                         let rec = RequestRecord {
                             at_ms: now_ms(),
                             account_id: account.slot.id.clone(),
@@ -625,11 +681,19 @@ async fn run_generation(
                 let payload = json!({
                     "error": { "message": e.to_string(), "type": e.code() }
                 });
-                yield Ok(Bytes::from(match public {
-                    PublicProtocol::OpenAi => format!("data: {payload}\n\n"),
-                    // Anthropic 客户端按 event/data 两行解析，错误也要带 event 名
-                    PublicProtocol::Anthropic => format!("event: error\ndata: {payload}\n\n"),
-                }));
+                match public {
+                    PublicProtocol::OpenAi => {
+                        yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                    }
+                    PublicProtocol::Anthropic => {
+                        yield Ok(Bytes::from(format!("event: error\ndata: {payload}\n\n")));
+                    }
+                    PublicProtocol::Responses => {
+                        for sse in responses_builder.fail(&e.to_string()) {
+                            yield Ok(Bytes::from(sse));
+                        }
+                    }
+                }
             }
             match public {
                 PublicProtocol::OpenAi => yield Ok(Bytes::from(SSE_DONE)),
@@ -639,6 +703,11 @@ async fn run_generation(
                     // 否则客户端状态机会一直等待（表现为「答完了界面还在转圈」）。
                     for sse in anthropic_builder.finish() {
                         yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(sse.to_sse()));
+                    }
+                }
+                PublicProtocol::Responses => {
+                    for sse in responses_builder.finish() {
+                        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(sse));
                     }
                 }
             }

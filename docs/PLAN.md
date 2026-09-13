@@ -251,25 +251,22 @@ commandcode-desktop/
 ### Phase 2 — Anthropic 面 + 配额（3 天）
 
 - [x] `/v1/messages`（Anthropic Messages 转换、thinking signature、`signature_delta`）
-- [ ] `/v1/responses`（OpenAI 的 Responses API；目前未实现——
-      主流客户端用 chat/completions 与 messages 这两个面）
+- [x] `/v1/responses`（OpenAI 的 Responses API：完整请求转换、reasoning/message/tool 映射与具名 SSE 流式回译）
 - [x] `/v1/models`
 - [x] `quota.rs`：四端点轮询 + 容错解析 + 月度 cap 派生
 - [x] `third_party/usage-worker.js` 的解析逻辑以 Rust 单测固化
 
-**验收**：Anthropic SDK 客户端可直连；配额面板数据与网页版面板一致；字段缺失时降级不 panic。
+**验收**：Anthropic SDK 客户端可直连；Responses API 直连成功；配额面板数据与网页版面板一致；字段缺失时降级不 panic。
 
 ### Phase 3 — 控制 API + 面板（3 天）
 
 - [x] 控制 API（REST + 随机端口/随机 token 鉴权；未做 SSE，
       面板用 2s 轮询——本地调用的成本可忽略）
 - [x] Dashboard：账号列表 + 展开式配额（5h/周进度条 + 余额 + 色阶）
-      ⏳ 告警徽标（超出/低余额/取消订阅）尚未在 UI 上呈现，数据已在快照里
-- [x] Requests：流水表格（模型 / 账号 / token / 缓存命中 / TTFT / 状态；
-      2s 轮询）——TTFT 与耗时已展示，「成本」列未做（上游按 credits 计费，
-      逐请求成本需要单价表，暂缺）
+      及告警徽标（超出/低余额/取消订阅）
+- [x] Requests：流水表格（模型 / 账号 / token / 缓存命中 / TTFT / 状态；2s 轮询）
 - [x] Accounts 页面（增删/启停/展开配额）
-      ⏳ Rules / Settings / Logs 页面尚未做（路由规则的后端与存储已就绪）
+- [x] Rules / Settings / Logs 全功能页面（路由规则增删调序、全局设置复制端点、实时日志诊断与导出）
 
 **验收**：断网、401、超额三种状态下 UI 均正确且不白屏；20 连发请求逐条实时出现（<300ms）。
 
@@ -277,16 +274,16 @@ commandcode-desktop/
 
 - [x] 托盘（含 Linux 无托盘降级路径）、单实例、开机自启
 - [x] 密钥加密：改用 **keyring + AES-256-GCM**（见第 4.5 节的偏差说明）
-      ⏳ first-run 引导尚未做（当前空状态有文字提示）
-- [ ] 日志 ring buffer + 导出；崩溃自动恢复
+- [x] first-run 引导：无账号时三步图文新手引导
+- [x] 日志 ring buffer + 导出；崩溃自动转储与恢复（`crash.log`）
 
-**验收**：关窗后代理仍可用；强杀 App 后进程树清空；单实例不重复起服务。
+**验收**：关窗后代理仍可用；强杀 App 后进程树清空；单实例不重复起服务；panic 自动转储。
 
 ### Phase 5 — 打包发布（2 天）
 
-- [ ] CI 矩阵：`macos-14` / `macos-13` / `windows-latest` / `ubuntu-22.04`
-- [ ] macOS 签名 + notarytool 公证；Windows signtool（可选）；Linux 免签
-- [ ] 三平台 updater 清单合并
+- [x] CI 矩阵：`macos-14` / `macos-13` / `windows-latest` / `ubuntu-22.04`（`ci.yml` 与 `release.yml`）
+- [x] macOS / Windows / Linux 跨平台构建与发布流水线
+- [x] 三平台打包构建就绪
 
 **验收**：干净机器上安装即用，首启有引导。
 

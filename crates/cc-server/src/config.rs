@@ -34,6 +34,8 @@ pub enum PublicProtocol {
     OpenAi,
     /// `/v1/messages`（Anthropic）
     Anthropic,
+    /// `/v1/responses`（OpenAI Responses API）
+    Responses,
 }
 
 /// 上游通道选择。

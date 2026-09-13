@@ -605,3 +605,60 @@ async fn anthropic_system_and_tools_survive_the_conversion() {
     assert_eq!(body["params"]["tools"][0]["name"], "read_file");
     assert_eq!(body["params"]["tools"][0]["input_schema"]["type"], "object");
 }
+
+#[tokio::test]
+async fn responses_non_stream_returns_response_object() {
+    let mock = MockUpstream::start([MockResponse::StreamSuccess {
+        text: "hello responses api".into(),
+    }])
+    .await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, body) = post_to(
+        state,
+        "/v1/responses",
+        json!({
+            "model": "m",
+            "instructions": "system instruction",
+            "input": "test prompt",
+            "stream": false
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    let parsed: Value = serde_json::from_str(&body).expect("valid json");
+    assert_eq!(parsed["object"], "response");
+    assert_eq!(parsed["status"], "completed");
+    assert_eq!(parsed["output_text"], "hello responses api");
+    assert_eq!(parsed["output"][0]["type"], "message");
+}
+
+#[tokio::test]
+async fn responses_stream_emits_responses_events() {
+    let mock = MockUpstream::start([MockResponse::StreamSuccess {
+        text: "streaming chunk".into(),
+    }])
+    .await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, body) = post_to(
+        state,
+        "/v1/responses",
+        json!({
+            "model": "m",
+            "input": "test stream",
+            "stream": true
+        }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("event: response.created"));
+    assert!(body.contains("event: response.in_progress"));
+    assert!(body.contains("event: response.output_item.added"));
+    assert!(body.contains("event: response.output_text.delta"));
+    assert!(body.contains("event: response.completed"));
+}
