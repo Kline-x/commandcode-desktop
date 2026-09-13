@@ -99,6 +99,63 @@
 
 ---
 
+## 4.5 实施状态（截至当前提交）
+
+### 已落地
+
+| 模块 | 文件 | 测试 |
+|---|---|---|
+| 错误语义与轮换判定 | `error.rs` | 9 |
+| 上游事件解析 | `sse.rs` | 11 |
+| 账号池与轮换状态机 | `pool.rs` | 28 |
+| 连接配置 | `config.rs` | 1 |
+| 请求转换 | `convert.rs` | 33 |
+| 上游 HTTP 客户端 | `upstream.rs` | 10 |
+| OpenAI SSE 翻译 | `openai.rs` | 13 |
+| Anthropic 协议面 | `anthropic.rs` | 52 |
+| 配额解析 | `quota.rs` | 33 |
+| 配额轮询器 | `quota_poller.rs` | 16 |
+| 本地代理服务 | `proxy.rs` | 7 |
+| 控制 API | `control.rs` | 10 |
+| SQLite 存储 | `store.rs` | 15 |
+| 时间工具 | `time.rs` | 3 |
+| mock 上游 | `mock_upstream.rs` | 10 |
+| 端到端（错误矩阵 + 双协议） | `tests/e2e_rotation.rs` | 16 |
+| **合计** | | **≈275** |
+
+产物：`Command Code.app`（18 MB）+ `.dmg`（5.9 MB），本机 arm64 实测可运行。
+
+### 与计划的偏差
+
+| 计划 | 实际 | 原因 |
+|---|---|---|
+| `tauri-plugin-stronghold` 存主密钥 | **`keyring` + AES-256-GCM** | stronghold 需要口令派生（每次启动要用户交互）；`keyring` 直接对接系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service），无交互。AES-GCM 提供认证加密，篡改即失败 |
+| 单 crate `cc-server` 内分 `proxy/upstream/...` 子模块 | 顶层平铺 `proxy.rs`/`upstream.rs`/... | 模块数量与耦合度都还不需要目录层级；平铺更易导航，将来变大再拆 |
+| 控制面走 HTTP 供前端读写 | 读走 HTTP，**写（增删账号）走 Tauri IPC** | 明文密钥的加密必须发生在 Rust 侧。若让前端调 HTTP 写接口，它就得自己加密——等于把加密逻辑与主密钥暴露给 WebView |
+
+### 真机运行才暴露的缺陷（单测不可能发现）
+
+这一节值得单独记录：下面每个问题都让应用**完全不可用**，而 `cargo test` 全绿。
+
+| # | 症状 | 根因 |
+|---|---|---|
+| 1 | 启动即 abort | `tauri.conf.json` 声明了窗口，`setup()` 又建同名窗口 → `webview with label main already exists` |
+| 2 | 端口在 LISTEN 但无任何响应 | std `TcpListener` 未设 `nonblocking`，`axum::serve` 的 async accept 阻塞式占死运行时线程 |
+| 3 | 上一条的连带 | `TcpListener::from_std` 必须在**运行时上下文内**调用（`setup` 钩子跑在主线程、无运行时） |
+| 4 | 窗口全白 | Vite 产出绝对路径 `/assets/...`，Tauri 自定义协议下解析失败 → 改 `base: "./"` |
+| 5 | 窗口全白（另一种） | 缺 `src-tauri/capabilities/default.json`（Tauri 2 的权限声明） |
+| 6 | 界面 `Load failed` | WebView 页面源 `tauri://localhost` 与控制面 `http://127.0.0.1:<随机端口>` 跨源，缺 CORS 头时 fetch 直接失败 |
+| 7 | 加 CORS 后变 401 | 层序错误：axum 中**后应用的在更外层**，CORS 被放在鉴权内层，OPTIONS 预检先被拒 |
+| 8 | 界面持续 404 | 前端把控制面的 `/api/health` 写成了代理面的 `/health` |
+| 9 | 请求流水永远为空 | `ProxyState::with_observer` 从未被调用——模块有测试但没接线 |
+| 10 | 账号额度永远是初始值 | `QuotaPoller::run()` 从未被调用 |
+
+**教训**：`cargo build` 通过、单测全绿，都不等于「能跑」。凡是跨进程边界
+（Tauri 生命周期、自定义协议、CORS、运行时上下文）的缺陷，只能靠真机运行发现。
+因此每个 Phase 的验收都必须包含一次「实际启动并观察」。
+
+---
+
 ## 5. 模块映射（JS → Rust）
 
 ```
