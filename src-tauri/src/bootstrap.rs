@@ -102,25 +102,33 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
     let control_url = format!("http://{control_addr}");
     let proxy_url = format!("http://{proxy_addr}");
 
-    // 两个服务各自跑在 tokio 运行时上；生命周期跟随进程
+    // 两个服务各自跑在 tokio 运行时上；生命周期跟随进程。
+    //
+    // ⚠️ 必须先把 std 监听器设为 **nonblocking** 再交给 tokio：tokio 的
+    // TcpListener::from_std 不会替你改这个标志，而 axum::serve 内部是 async
+    // accept；监听器仍是阻塞模式时，一次 accept 就会把运行时工作线程占住，
+    // 表现为「端口在 LISTEN、TCP 连接能建立，但永远收不到响应」。
+    // 这个 bug 只在真正运行二进制时才会暴露（单测里用的是 tokio 自己的监听器）。
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = axum::serve(
-            tokio::net::TcpListener::from_std(control_listener).unwrap(),
-            control_app,
-        )
-        .await
-        {
-            tracing::error!(%error, "控制面退出");
+        // 转换必须发生在运行时**内部**：TcpListener::from_std 要向 tokio reactor
+        // 注册，在 setup 钩子（主线程、无运行时上下文）里调用会 panic。
+        match to_tokio_listener(control_listener, control_addr) {
+            Ok(listener) => {
+                if let Err(error) = axum::serve(listener, control_app).await {
+                    tracing::error!(%error, "控制面退出");
+                }
+            }
+            Err(error) => tracing::error!(%error, "控制面无法启动"),
         }
     });
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = axum::serve(
-            tokio::net::TcpListener::from_std(proxy_listener).unwrap(),
-            proxy_app,
-        )
-        .await
-        {
-            tracing::error!(%error, "代理面退出");
+        match to_tokio_listener(proxy_listener, proxy_addr) {
+            Ok(listener) => {
+                if let Err(error) = axum::serve(listener, proxy_app).await {
+                    tracing::error!(%error, "代理面退出");
+                }
+            }
+            Err(error) => tracing::error!(%error, "代理面无法启动"),
         }
     });
 
@@ -222,4 +230,24 @@ fn load_key_map(store: &Store) -> std::collections::HashMap<String, String> {
         Err(error) => tracing::error!(%error, "读取账号失败"),
     }
     map
+}
+
+/// 把标准库监听器转成 tokio 监听器，并确保它是非阻塞的。
+///
+/// 见调用处的说明：漏掉 nonblocking 会让 async 运行时的工作线程被一次
+/// 阻塞式 accept 占死，症状是端口在监听但没有任何响应。
+fn to_tokio_listener(
+    listener: TcpListener,
+    addr: SocketAddr,
+) -> Result<tokio::net::TcpListener, StartupError> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| StartupError::Bind {
+            addr,
+            reason: e.to_string(),
+        })?;
+    tokio::net::TcpListener::from_std(listener).map_err(|e| StartupError::Bind {
+        addr,
+        reason: e.to_string(),
+    })
 }

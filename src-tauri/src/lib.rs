@@ -55,15 +55,16 @@ pub fn run() {
                 }
             };
 
-            let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            // 把控制面地址与 token 作为 initialization script 注入：
+            // 它在页面任何 JS 之前执行，因此 React 的首个 fetch 就能带上 token
+            // （若改用 build 之后的 eval，首屏请求会先发出并拿到 401）。
+            let init_script = bootstrap::init_script(&state.control_base_url, &state.control_token);
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Command Code")
                 .inner_size(1100.0, 760.0)
                 .min_inner_size(820.0, 560.0)
+                .initialization_script(&init_script)
                 .build()?;
-
-            // 把控制面地址与 token 注入页面：只有本 WebView 知道这个 token
-            let init_script = bootstrap::init_script(&state.control_base_url, &state.control_token);
-            window.eval(&init_script)?;
 
             tray::install(&handle, &state)?;
             // 存储句柄单独 manage：IPC 命令需要它，而它不属性 AppState 的职责

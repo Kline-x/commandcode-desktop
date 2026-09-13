@@ -10,16 +10,7 @@
     "beforeBuildCommand": "pnpm build"
   },
   "app": {
-    "windows": [
-      {
-        "title": "Command Code",
-        "width": 1100,
-        "height": 760,
-        "minWidth": 820,
-        "minHeight": 560,
-        "resizable": true
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }
