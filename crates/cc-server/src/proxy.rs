@@ -180,9 +180,14 @@ pub fn router(state: Arc<ProxyState>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
+        .route("/models", get(list_models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/chat/completions", post(chat_completions))
         .route("/v1/messages", post(messages))
+        .route("/messages", post(messages))
+        .route("/v1/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
+        .route("/responses", post(responses))
         .with_state(state)
 }
 
@@ -981,5 +986,68 @@ mod tests {
         let resolved = state.resolved();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].key, "key-1");
+    }
+
+    #[tokio::test]
+    async fn alias_routes_are_bound_and_reachable() {
+        let state =
+            Arc::new(ProxyState::new(Config::default(), Vec::new(), Arc::new(|_| None)).unwrap());
+        let app = router(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+
+        // 验证 Anthropic 容错路径: /messages 与 /v1/v1/messages
+        let r1 = client
+            .post(format!("http://{addr}/messages"))
+            .json(&json!({"model": "claude-3-opus", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r1.status().as_u16(),
+            401,
+            "/messages 路由应到达并返回 401（未配置 key）而非 404"
+        );
+
+        let r2 = client
+            .post(format!("http://{addr}/v1/v1/messages"))
+            .json(&json!({"model": "claude-3-opus", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r2.status().as_u16(),
+            401,
+            "/v1/v1/messages 容错路由应到达并返回 401 而非 404"
+        );
+
+        // 验证 OpenAI 容错路径: /chat/completions 与 /responses
+        let r3 = client
+            .post(format!("http://{addr}/chat/completions"))
+            .json(&json!({"model": "gpt-4o", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r3.status().as_u16(),
+            401,
+            "/chat/completions 路由应到达并返回 401 而非 404"
+        );
+
+        let r4 = client
+            .post(format!("http://{addr}/responses"))
+            .json(&json!({"model": "gpt-4o", "input": "hi"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r4.status().as_u16(),
+            401,
+            "/responses 路由应到达并返回 401 而非 404"
+        );
     }
 }

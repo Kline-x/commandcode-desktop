@@ -37,67 +37,71 @@ export function App(): React.JSX.Element {
   return (
     <div className="app">
       <header className="app__header">
-        <div className="app__branding">
-          <h1>Command Code</h1>
-          <span className={`badge ${health ? "badge--ok" : "badge--down"}`}>
-            {health ? "代理运行中 (3050)" : "代理未就绪"}
-          </span>
-        </div>
+        <div className="app__header-inner">
+          <div className="app__branding">
+            <h1>Command Code</h1>
+            <span className={`badge ${health ? "badge--ok" : "badge--down"}`}>
+              {health ? "代理运行中 (3050)" : "代理未就绪"}
+            </span>
+          </div>
 
-        <nav className="nav-tabs">
-          <button
-            className={`nav-tab ${activeTab === "dashboard" ? "nav-tab--active" : ""}`}
-            onClick={() => setActiveTab("dashboard")}
-          >
-            📊 仪表盘
-          </button>
-          <button
-            className={`nav-tab ${activeTab === "requests" ? "nav-tab--active" : ""}`}
-            onClick={() => setActiveTab("requests")}
-          >
-            ⚡ 请求流水
-          </button>
-          <button
-            className={`nav-tab ${activeTab === "rules" ? "nav-tab--active" : ""}`}
-            onClick={() => setActiveTab("rules")}
-          >
-            🔀 路由规则
-          </button>
-          <button
-            className={`nav-tab ${activeTab === "settings" ? "nav-tab--active" : ""}`}
-            onClick={() => setActiveTab("settings")}
-          >
-            ⚙️ 全局设置
-          </button>
-          <button
-            className={`nav-tab ${activeTab === "logs" ? "nav-tab--active" : ""}`}
-            onClick={() => setActiveTab("logs")}
-          >
-            📝 运行日志
-          </button>
-        </nav>
+          <nav className="nav-tabs">
+            <button
+              className={`nav-tab ${activeTab === "dashboard" ? "nav-tab--active" : ""}`}
+              onClick={() => setActiveTab("dashboard")}
+            >
+              📊 仪表盘
+            </button>
+            <button
+              className={`nav-tab ${activeTab === "requests" ? "nav-tab--active" : ""}`}
+              onClick={() => setActiveTab("requests")}
+            >
+              ⚡ 请求流水
+            </button>
+            <button
+              className={`nav-tab ${activeTab === "rules" ? "nav-tab--active" : ""}`}
+              onClick={() => setActiveTab("rules")}
+            >
+              🔀 路由规则
+            </button>
+            <button
+              className={`nav-tab ${activeTab === "settings" ? "nav-tab--active" : ""}`}
+              onClick={() => setActiveTab("settings")}
+            >
+              ⚙️ 全局设置
+            </button>
+            <button
+              className={`nav-tab ${activeTab === "logs" ? "nav-tab--active" : ""}`}
+              onClick={() => setActiveTab("logs")}
+            >
+              📝 运行日志
+            </button>
+          </nav>
+        </div>
       </header>
 
-      {error !== null && (
-        <p className="notice notice--warn">
-          无法连接本地服务：{error}
-          <br />
-          请确认后台进程已就绪；连接恢复后界面会自动同步。
-        </p>
-      )}
-
-      <main className="app__main">
-        {activeTab === "dashboard" && (
-          <>
-            <ProxyPanel health={health} />
-            <AccountsPanel />
-          </>
+      <div className="app__content">
+        {error !== null && (
+          <p className="notice notice--warn">
+            无法连接本地服务：{error}
+            <br />
+            请确认后台进程已就绪；连接恢复后界面会自动同步。
+          </p>
         )}
-        {activeTab === "requests" && <RequestsPanel />}
-        {activeTab === "rules" && <RulesPanel />}
-        {activeTab === "settings" && <SettingsPanel />}
-        {activeTab === "logs" && <LogsPanel />}
-      </main>
+
+        <main className="app__main">
+          {activeTab === "dashboard" && (
+            <>
+              <ProxyPanel health={health} />
+              <AccountsPanel />
+            </>
+          )}
+          {activeTab === "requests" && <RequestsPanel />}
+          {activeTab === "rules" && <RulesPanel />}
+          {activeTab === "settings" && <SettingsPanel />}
+          {activeTab === "logs" && <LogsPanel />}
+        </main>
+      </div>
     </div>
   );
 }
