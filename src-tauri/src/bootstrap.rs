@@ -41,10 +41,63 @@ pub enum StartupError {
     Core(String),
 }
 
+/// 账号池与轮询器的热重载器。
+#[derive(Clone)]
+pub struct AccountReloader {
+    store: Arc<Store>,
+    secrets: Arc<crate::secrets::Secrets>,
+    proxy_state: Arc<ProxyState>,
+    poller: Arc<cc_server::quota_poller::QuotaPoller>,
+}
+
+impl AccountReloader {
+    pub fn new(
+        store: Arc<Store>,
+        secrets: Arc<crate::secrets::Secrets>,
+        proxy_state: Arc<ProxyState>,
+        poller: Arc<cc_server::quota_poller::QuotaPoller>,
+    ) -> Self {
+        Self {
+            store,
+            secrets,
+            proxy_state,
+            poller,
+        }
+    }
+
+    /// 从数据库重新加载启用的账号和解密密钥，并热更新代理池和配额轮询器。
+    pub fn reload(&self) {
+        let slots = load_slots(&self.store);
+        let key_lookup = Arc::new(load_key_map(&self.store, &self.secrets));
+        let resolve_key: KeyResolver = {
+            let map = key_lookup.clone();
+            Arc::new(move |slot: &cc_server::AccountSlot| map.get(&slot.id).cloned())
+        };
+        self.proxy_state
+            .set_accounts(slots.clone(), Arc::clone(&resolve_key));
+        self.poller.set_accounts(&slots, &resolve_key);
+        tracing::info!(count = slots.len(), "账号池与配额轮询器已完成热重载");
+
+        // 立即触发一轮探测，无需干等下一个周期
+        let poller = Arc::clone(&self.poller);
+        tauri::async_runtime::spawn(async move {
+            poller.poll_once().await;
+        });
+    }
+}
+
 /// 启动后台服务，返回给前端用的连接信息。
 pub fn start(
     app: &AppHandle,
-) -> Result<(AppState, Arc<Store>, Arc<crate::secrets::Secrets>), StartupError> {
+) -> Result<
+    (
+        AppState,
+        Arc<Store>,
+        Arc<crate::secrets::Secrets>,
+        AccountReloader,
+    ),
+    StartupError,
+> {
     let data_dir = data_dir(app)?;
     std::fs::create_dir_all(&data_dir).map_err(|e| StartupError::DataDir(e.to_string()))?;
 
@@ -64,12 +117,6 @@ pub fn start(
                 .unwrap_or_else(|_| SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
             reason: e.to_string(),
         })?;
-
-    let control_state = Arc::new(
-        ControlState::new(store.clone(), control_token.clone())
-            .with_api_base("https://api.commandcode.ai"),
-    );
-    let control_app = control_router(control_state);
 
     // 代理面：固定 127.0.0.1:3050（客户端要能预期这个地址）
     let proxy_listener =
@@ -145,6 +192,22 @@ pub fn start(
     ));
     poller.set_accounts(&slots, &resolve_key);
 
+    let reloader = AccountReloader::new(
+        store.clone(),
+        secrets.clone(),
+        proxy_state.clone(),
+        poller.clone(),
+    );
+
+    let reloader_for_control = reloader.clone();
+    let control_state = Arc::new(
+        ControlState::new(store.clone(), control_token.clone())
+            .with_api_base("https://api.commandcode.ai")
+            .with_account_callback(Arc::new(move || {
+                reloader_for_control.reload();
+            })),
+    );
+    let control_app = control_router(control_state);
     let proxy_app = proxy_router(proxy_state);
 
     let control_url = format!("http://{control_addr}");
@@ -178,6 +241,36 @@ pub fn start(
         tracing::debug!("配额轮询已停止");
     });
 
+    // 配额更新回写：将轮询快照同步写入 SQLite accounts 表
+    let mut quota_rx = poller.subscribe();
+    let store_for_quota = store.clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match quota_rx.recv().await {
+                Ok(update) => {
+                    if let Ok(id) = update.account_id.parse::<i64>() {
+                        let quota_json = serde_json::to_string(&update.snapshot).ok();
+                        let last_error = update.snapshot.last_error.as_deref();
+                        if let Err(error) = store_for_quota.update_account_quota(
+                            id,
+                            quota_json.as_deref(),
+                            last_error,
+                            update.at_ms,
+                        ) {
+                            tracing::warn!(%error, id, "写入账号配额快照失败");
+                        }
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(skipped, "配额回写通道落后，跳过过旧消息");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    });
+
     tauri::async_runtime::spawn(async move {
         match to_tokio_listener(proxy_listener, proxy_addr) {
             Ok(listener) => {
@@ -201,6 +294,7 @@ pub fn start(
         },
         store,
         secrets,
+        reloader,
     ))
 }
 

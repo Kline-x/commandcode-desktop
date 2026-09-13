@@ -70,7 +70,11 @@ pub async fn add_account(
         .insert_account(&label, &cipher, &hint, created_at_ms)
         .map_err(|e| CommandError::from(e.to_string()))?;
 
-    tracing::info!(account_id = id, %label, key_hint = %hint, "账号已添加");
+    if let Some(reloader) = app.try_state::<crate::bootstrap::AccountReloader>() {
+        reloader.reload();
+    }
+
+    tracing::info!(account_id = id, %label, key_hint = %hint, "账号已添加并热重载到账号池");
     Ok(AddAccountResult { id, key_hint: hint })
 }
 

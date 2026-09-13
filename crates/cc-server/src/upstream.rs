@@ -185,7 +185,10 @@ impl UpstreamClient {
         match map.get(key) {
             Some((true, at)) if now - at < PROTOCOL_CACHE_TTL_MS => UpstreamProtocol::Cli,
             Some((false, at)) if now - at < PROTOCOL_CACHE_TTL_MS => UpstreamProtocol::ProviderApi,
-            _ => UpstreamProtocol::ProviderApi,
+            // 未知账号默认 CLI：我们只构造 CLI 形状的 body。
+            // 改成 ProviderApi 需要同时补一个 Provider 形状的构造器，
+            // 否则上游会报 `param: model` expected string, received undefined。
+            _ => UpstreamProtocol::Cli,
         }
     }
 
@@ -199,10 +202,9 @@ impl UpstreamClient {
     pub fn endpoint(&self, protocol: UpstreamProtocol) -> String {
         let base = self.config.api_base.trim_end_matches('/');
         match protocol {
-            UpstreamProtocol::Cli => format!("{base}/alpha/generate"),
-            UpstreamProtocol::ProviderApi | UpstreamProtocol::Auto => {
-                format!("{base}/provider/v1/chat/completions")
-            }
+            // Auto 等价于 CLI：我们只构造 CLI 形状的请求体（见 UpstreamProtocol 文档）
+            UpstreamProtocol::Cli | UpstreamProtocol::Auto => format!("{base}/alpha/generate"),
+            UpstreamProtocol::ProviderApi => format!("{base}/provider/v1/chat/completions"),
         }
     }
 
@@ -629,10 +631,10 @@ mod tests {
             client.endpoint(UpstreamProtocol::ProviderApi),
             "https://api.commandcode.ai/provider/v1/chat/completions"
         );
-        // Auto 默认走文档化的 Provider API 面
+        // Auto 目前等价于 CLI：请求体只有 CLI 形状，发给 Provider API 会被拒
         assert_eq!(
             client.endpoint(UpstreamProtocol::Auto),
-            "https://api.commandcode.ai/provider/v1/chat/completions"
+            "https://api.commandcode.ai/alpha/generate"
         );
     }
 
@@ -697,16 +699,22 @@ mod tests {
     }
 
     #[test]
-    fn protocol_preference_defaults_to_provider_api_then_learns_cli_only() {
+    fn protocol_preference_defaults_to_cli() {
+        // 默认必须是 CLI。我们只构造 CLI 形状的请求体，把那个形状发给
+        // Provider API 会被上游拒绝：Invalid input: expected string,
+        // received undefined (param: model)——这是真机跑出来的。
+        // 这个断言是回归保护：改回 ProviderApi 前必须先补上 Provider 形状的构造器。
         let client = UpstreamClient::new(Config::default()).unwrap();
-        assert_eq!(client.initial_protocol("k"), UpstreamProtocol::ProviderApi);
+        assert_eq!(client.initial_protocol("k"), UpstreamProtocol::Cli);
+        assert_eq!(client.initial_protocol("another"), UpstreamProtocol::Cli);
+    }
+
+    #[test]
+    fn learned_cli_only_preference_is_remembered_per_key() {
+        let client = UpstreamClient::new(Config::default()).unwrap();
         client.remember_cli_only("k");
         assert_eq!(client.initial_protocol("k"), UpstreamProtocol::Cli);
-        // 只影响该 key
-        assert_eq!(
-            client.initial_protocol("other"),
-            UpstreamProtocol::ProviderApi
-        );
+        assert_eq!(client.initial_protocol("other"), UpstreamProtocol::Cli);
     }
 
     #[test]

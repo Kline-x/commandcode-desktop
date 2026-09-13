@@ -39,11 +39,19 @@ pub enum PublicProtocol {
 /// 上游通道选择。
 ///
 /// `/provider/v1/*` 是文档化的接口（需 Pro+ 套餐）；`/alpha/generate` 是逆向所得、
-/// **Go 套餐唯一可用**的通道。`Auto` 先试 Provider API，被 `upgrade_required`
-/// 打回后固定降级到 CLI 通道并记忆一段时间。
+/// **Go 套餐唯一可用**的通道。
+///
+/// ⚠️ **默认走 CLI 通道**，原因是我们目前只构造 CLI 形状的请求体
+/// （`{config, params:{model, messages, ...}}`）。Provider API 期望的是
+/// 顶层 `{model, messages, ...}`，把 CLI 形状的 body 发过去会被上游拒绝：
+/// `Invalid input: expected string, received undefined` (param: model)。
+///
+/// 参考实现 proxy.mjs **也只走 `/alpha/generate`**——它没有实现 Provider
+/// 形状的 body 构造。要启用 Provider 通道，需要先补一个对应的构造器
+/// （见 docs/PLAN.md 的待办）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum UpstreamProtocol {
-    /// 自动：先 Provider API，遇 `upgrade_required` 降级到 CLI。
+    /// 自动：目前等价于 CLI（见上文的说明）。
     #[default]
     Auto,
     /// 强制走 `/alpha/generate`。

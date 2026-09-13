@@ -24,6 +24,7 @@
 //! 需要「现在」的地方一律由参数注入 `now_ms: i64`，不在函数内部读系统时间
 //! （docs/STYLE.md 第 2.3 节，全仓库硬性约定，pool.rs 已落地）。
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// 可用余额低于该值时告警的兜底阈值（credit）。
@@ -254,7 +255,7 @@ fn epoch_ms_any(record: &Value, keys: &[&str]) -> Option<i64> {
 }
 
 /// 账号身份（来自 `/alpha/whoami`）。见 docs/PROTOCOL.md 第 7 节。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountIdentity {
     /// `user.id`；缺失或类型漂移时为 None。
     pub user_id: Option<String>,
@@ -298,7 +299,7 @@ impl AccountIdentity {
 }
 
 /// 一个滚动窗口（5 小时 / 周）的用量。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowUsage {
     /// 已用额度；缺失时降级为 0。
     pub used: f64,
@@ -346,7 +347,7 @@ pub fn window_reset_wait_ms(window: &WindowUsage, now_ms: i64) -> i64 {
 }
 
 /// 余额（来自 `/alpha/billing/credits` 的 `credits`）。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Credits {
     /// 套餐内含的月度剩余额度；缺失降级为 0。
     pub monthly: f64,
@@ -386,7 +387,7 @@ impl Credits {
 /// 套餐未知或账期结束时间缺失时 `derived = false`，此时 [`MonthlyQuota::cap`] 为 0、
 /// [`MonthlyQuota::used`] **承载的是剩余余额**（不要拿它算进度百分比），
 /// 前端据此降级为「只显示余额」。见 third_party/usage-worker.js 的 `monthlyCredits` 注释。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MonthlyQuota {
     /// 已用额度；`derived = false` 时该字段承载的是剩余余额（仅用于展示）。
     pub used: f64,
@@ -402,7 +403,7 @@ pub struct MonthlyQuota {
 ///
 /// **为什么用带数据的枚举**：告警需要携带窗口名这类上下文；若只给标记，
 /// 前端得回头再查一遍快照，容易与它看到的数据不一致。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuotaAlert {
     /// 某个滚动窗口已超限；参数是窗口在实际响应里的键名（如 `fiveHour`）。
     WindowExceeded(String),
@@ -451,7 +452,7 @@ impl QuotaAlert {
 ///
 /// 字段全部可缺省：某个端点失败时其余字段仍然可用（docs/PROTOCOL.md 第 7 节）。
 /// 本结构是**只读结果**，探针失败不影响账号池状态。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct QuotaSnapshot {
     /// whoami 解析出的身份；whoami 失败时保持默认值（label 为空串）。
     pub identity: AccountIdentity,
@@ -1291,5 +1292,47 @@ mod tests {
         assert!(snapshot.monthly.is_none());
         assert_eq!(snapshot.identity.label, "", "畸形 whoami 降级为空身份");
         assert_eq!(snapshot.plan_id, None);
+    }
+
+    #[test]
+    fn snapshot_serialization_roundtrip() {
+        let snapshot = QuotaSnapshot {
+            identity: AccountIdentity {
+                user_id: Some("u-1".into()),
+                user_name: Some("user1".into()),
+                label: "User One".into(),
+                org_id: Some("org-1".into()),
+            },
+            credits: Some(Credits {
+                monthly: 10.0,
+                purchased: 5.0,
+                free: 0.0,
+                plan_id: Some("individual-pro".into()),
+            }),
+            five_hour: Some(WindowUsage {
+                used: 2.0,
+                cap: 10.0,
+                exceeded: false,
+                reset_at_ms: 1000,
+            }),
+            weekly: None,
+            monthly: Some(MonthlyQuota {
+                used: 20.0,
+                cap: 30.0,
+                reset_at_ms: 2000,
+                derived: true,
+            }),
+            plan_id: Some("individual-pro".into()),
+            plan_status: Some("active".into()),
+            period_end_ms: Some(2000),
+            alerts: vec![
+                QuotaAlert::LowBalance,
+                QuotaAlert::WindowExceeded("fiveHour".into()),
+            ],
+            last_error: None,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let parsed: QuotaSnapshot = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, snapshot);
     }
 }

@@ -22,6 +22,9 @@ use serde_json::json;
 
 use crate::store::{NewRequest, Store};
 
+/// 账号变更回调类型。
+pub type AccountChangeCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// 控制面共享状态。
 pub struct ControlState {
     /// 存储句柄。
@@ -30,6 +33,8 @@ pub struct ControlState {
     pub token: String,
     /// 上游基址。
     pub api_base: String,
+    /// 账号变更回调（通知代理池与轮询器热重载）。
+    pub on_account_changed: Option<AccountChangeCallback>,
 }
 
 impl ControlState {
@@ -39,6 +44,7 @@ impl ControlState {
             store,
             token: token.into(),
             api_base: "https://api.commandcode.ai".into(),
+            on_account_changed: None,
         }
     }
 
@@ -46,6 +52,19 @@ impl ControlState {
     pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
         self.api_base = api_base.into();
         self
+    }
+
+    /// 设置账号变更回调。
+    pub fn with_account_callback(mut self, cb: AccountChangeCallback) -> Self {
+        self.on_account_changed = Some(cb);
+        self
+    }
+
+    /// 触发账号变更通知。
+    pub fn notify_account_changed(&self) {
+        if let Some(cb) = &self.on_account_changed {
+            cb();
+        }
     }
 }
 
@@ -266,7 +285,10 @@ async fn create_account(
         &body.key_hint,
         body.created_at_ms,
     ) {
-        Ok(id) => axum::Json(json!({ "id": id })).into_response(),
+        Ok(id) => {
+            state.notify_account_changed();
+            axum::Json(json!({ "id": id })).into_response()
+        }
         Err(e) => control_error(e),
     }
 }
@@ -314,13 +336,17 @@ async fn update_account(
         )
             .into_response();
     }
+    state.notify_account_changed();
     axum::Json(json!({ "ok": true })).into_response()
 }
 
 /// 删除账号。
 async fn delete_account(State(state): State<Arc<ControlState>>, Path(id): Path<i64>) -> Response {
     match state.store.delete_account(id) {
-        Ok(true) => axum::Json(json!({ "ok": true })).into_response(),
+        Ok(true) => {
+            state.notify_account_changed();
+            axum::Json(json!({ "ok": true })).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             axum::Json(ControlError {

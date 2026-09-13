@@ -48,7 +48,7 @@ pub fn run() {
         ))
         .setup(|app| {
             let handle = app.handle().clone();
-            let (state, store, secrets) = match bootstrap::start(&handle) {
+            let (state, store, secrets, reloader) = match bootstrap::start(&handle) {
                 Ok(tuple) => tuple,
                 Err(error) => {
                     // 启动失败必须让用户看见原因，而不是留一个空窗口
@@ -69,9 +69,10 @@ pub fn run() {
                 .build()?;
 
             tray::install(&handle, &state)?;
-            // 存储与密钥句柄单独 manage：IPC 命令需要它们
+            // 存储、密钥句柄与重载器单独 manage：IPC 命令需要它们
             app.manage(commands::StoreHandle(store));
             app.manage(commands::SecretsHandle(secrets));
+            app.manage(reloader);
             app.manage(state);
             Ok(())
         })

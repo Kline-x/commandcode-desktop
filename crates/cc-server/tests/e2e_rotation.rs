@@ -233,7 +233,10 @@ async fn upgrade_required_switches_to_cli_transport_without_burning_an_account()
     .await;
     let config = Config {
         api_base: mock.base_url().to_string(),
-        upstream_protocol: cc_server::UpstreamProtocol::Auto,
+        // 必须显式 ProviderApi：Auto 目前等价于 CLI（我们只构造 CLI 形状的
+        // 请求体），用 Auto 就测不到降级路径了。降级逻辑仍要保留——
+        // 手动配置 ProviderApi 时立刻可用，补上构造器后 Auto 也能走。
+        upstream_protocol: cc_server::UpstreamProtocol::ProviderApi,
         request_timeout: std::time::Duration::from_secs(5),
         stream_idle_timeout: std::time::Duration::from_millis(500),
         ..Config::default()

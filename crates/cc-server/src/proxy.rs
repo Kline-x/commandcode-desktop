@@ -81,13 +81,13 @@ pub struct ProxyState {
     /// 账号池（轮换状态）。
     pub pool: std::sync::Mutex<AccountPool>,
     /// 槽位列表（配置层事实）。
-    pub slots: Vec<AccountSlot>,
+    pub slots: std::sync::RwLock<Vec<AccountSlot>>,
     /// 凭据解析器。
-    pub resolve_key: KeyResolver,
+    pub resolve_key: std::sync::RwLock<KeyResolver>,
     /// 模型 → 账号路由规则。
-    pub rules: Vec<ModelAccountRule>,
+    pub rules: std::sync::RwLock<Vec<ModelAccountRule>>,
     /// 手动指定的账号 id。
-    pub preferred_id: Option<String>,
+    pub preferred_id: std::sync::RwLock<Option<String>>,
     /// 请求完成回调。
     pub observer: Option<RequestObserver>,
 }
@@ -104,23 +104,23 @@ impl ProxyState {
             config,
             upstream: Arc::new(upstream),
             pool: std::sync::Mutex::new(AccountPool::new()),
-            slots,
-            resolve_key,
-            rules: Vec::new(),
-            preferred_id: None,
+            slots: std::sync::RwLock::new(slots),
+            resolve_key: std::sync::RwLock::new(resolve_key),
+            rules: std::sync::RwLock::new(Vec::new()),
+            preferred_id: std::sync::RwLock::new(None),
             observer: None,
         })
     }
 
     /// 设置模型路由规则。
-    pub fn with_rules(mut self, rules: Vec<ModelAccountRule>) -> Self {
-        self.rules = rules;
+    pub fn with_rules(self, rules: Vec<ModelAccountRule>) -> Self {
+        *self.rules.write().unwrap_or_else(|e| e.into_inner()) = rules;
         self
     }
 
     /// 设置手动指定的账号。
-    pub fn with_preferred(mut self, id: Option<String>) -> Self {
-        self.preferred_id = id;
+    pub fn with_preferred(self, id: Option<String>) -> Self {
+        *self.preferred_id.write().unwrap_or_else(|e| e.into_inner()) = id;
         self
     }
 
@@ -130,15 +130,27 @@ impl ProxyState {
         self
     }
 
+    /// 热重载账号槽位与密钥解析器。
+    pub fn set_accounts(&self, slots: Vec<AccountSlot>, resolve_key: KeyResolver) {
+        *self.slots.write().unwrap_or_else(|e| e.into_inner()) = slots;
+        *self.resolve_key.write().unwrap_or_else(|e| e.into_inner()) = resolve_key;
+    }
+
+    /// 热重载模型路由规则。
+    pub fn set_rules(&self, rules: Vec<ModelAccountRule>) {
+        *self.rules.write().unwrap_or_else(|e| e.into_inner()) = rules;
+    }
+
     /// 解析出当前可用的账号列表。
     fn resolved(&self) -> Vec<ResolvedAccount> {
-        let keys: Vec<Option<String>> = self
-            .slots
-            .iter()
-            .map(|slot| (self.resolve_key)(slot))
-            .collect();
+        let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        let resolve = self.resolve_key.read().unwrap_or_else(|e| e.into_inner());
+        // clippy 建议写成 map(**resolve)，但 resolve 是 RwLockReadGuard<Arc<dyn Fn>>，
+        // 双重解引用会掩盖「这是一次 keychain 查询」的语义；显式闭包更清楚。
+        #[allow(clippy::redundant_closure)]
+        let keys: Vec<Option<String>> = slots.iter().map(|slot| resolve(slot)).collect();
         let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        pool.resolve(&self.slots, &keys)
+        pool.resolve(&slots, &keys)
     }
 
     /// 选出本次请求要用的账号，没有可用账号时返回池耗尽错误。
@@ -147,14 +159,10 @@ impl ProxyState {
         if accounts.is_empty() {
             return Err(CcError::MissingCredential);
         }
+        let rules = self.rules.read().unwrap_or_else(|e| e.into_inner());
+        let preferred = self.preferred_id.read().unwrap_or_else(|e| e.into_inner());
         let pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
-        match pool.select(
-            &accounts,
-            model,
-            &self.rules,
-            self.preferred_id.as_deref(),
-            now_ms(),
-        ) {
+        match pool.select(&accounts, model, &rules, preferred.as_deref(), now_ms()) {
             Some(found) => Ok(found.clone()),
             None => Err(pool.exhausted_error(&accounts, now_ms())),
         }
@@ -179,9 +187,10 @@ pub fn router(state: Arc<ProxyState>) -> Router {
 
 /// 健康检查。
 async fn health(State(state): State<Arc<ProxyState>>) -> Response {
+    let count = state.slots.read().unwrap_or_else(|e| e.into_inner()).len();
     axum::Json(json!({
         "status": "ok",
-        "accounts": state.slots.len(),
+        "accounts": count,
         "api_base": state.config.api_base,
     }))
     .into_response()
@@ -681,17 +690,13 @@ async fn run_generation(
 /// 解析下一个候选账号（不含已试过的）。
 fn next_account(state: &ProxyState, rotation: &Rotation) -> Option<ResolvedAccount> {
     let accounts = state.resolved();
+    let rules = state.rules.read().unwrap_or_else(|e| e.into_inner());
+    let preferred = state.preferred_id.read().unwrap_or_else(|e| e.into_inner());
     let pool = state.pool.lock().unwrap_or_else(|e| e.into_inner());
-    pool.select(
-        &accounts,
-        "",
-        &state.rules,
-        state.preferred_id.as_deref(),
-        now_ms(),
-    )
-    .filter(|a| !rotation.has_tried(&a.key))
-    .cloned()
-    .or_else(|| accounts.into_iter().find(|a| !rotation.has_tried(&a.key)))
+    pool.select(&accounts, "", &rules, preferred.as_deref(), now_ms())
+        .filter(|a| !rotation.has_tried(&a.key))
+        .cloned()
+        .or_else(|| accounts.into_iter().find(|a| !rotation.has_tried(&a.key)))
 }
 
 /// 记录一次请求的结果。
@@ -890,5 +895,22 @@ mod tests {
         assert_eq!(response.status().as_u16(), 401);
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+
+    #[test]
+    fn set_accounts_updates_slots_and_resolver() {
+        let config = Config::default();
+        let state = ProxyState::new(config, Vec::new(), Arc::new(|_| None)).unwrap();
+        assert_eq!(state.slots.read().unwrap().len(), 0);
+
+        let new_slots = vec![AccountSlot {
+            id: "1".into(),
+            label: "Acc1".into(),
+        }];
+        state.set_accounts(new_slots, Arc::new(|slot| Some(format!("key-{}", slot.id))));
+        assert_eq!(state.slots.read().unwrap().len(), 1);
+        let resolved = state.resolved();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].key, "key-1");
     }
 }
