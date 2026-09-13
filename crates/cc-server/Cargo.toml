@@ -41,6 +41,9 @@ sha2 = "0.10"
 rand = "0.9"
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+# CORS：WebView 的页面源是 tauri://localhost，向 http://127.0.0.1 发请求
+# 属于跨源，浏览器会强制 CORS 检查（缺头时表现为 fetch 直接失败）
+tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 

@@ -3,32 +3,168 @@
 //! **为什么单独一个模块**：这是本项目里唯一处理明文密钥的地方。把它隔离出来，
 //! 让「密钥从哪来、到哪去」可以在一处审阅，而不是散落在存储层、代理层与 UI 里。
 //!
-//! **当前实现**：占位（密文即明文的 UTF-8 字节）。这样 Phase 1–3 的功能可以
-//! 先跑通，而**接口形状已经定死**——接入 stronghold 时只需替换本文件的两个函数，
-//! 调用方（bootstrap.rs、控制面）无需改动。
+//! # 加密方案
 //!
-//! **接入 stronghold 的做法**（Phase 4 收尾）：
-//! 1. 首次启动生成主密钥，存进 `tauri-plugin-stronghold`（argon2 派生，纯 Rust，
-//!    三平台一致，不依赖 Linux 的 Secret Service）；
-//! 2. 用主密钥跑 AES-GCM，把「明文 key」加密成 `key_cipher`；
-//! 3. `decrypt_key` 反向操作；
-//! 4. 控制面只接收**密文**（见 control.rs 的 CreateAccountBody），因此本模块
-//!    是唯一的解密点。
+//! - **算法**：AES-256-GCM（认证加密）。GCM 自带完整性校验，密文被篡改时解密
+//!   会**失败**而不是产出垃圾明文——对密钥这种数据，静默损坏比报错危险得多。
+//! - **主密钥**：32 字节随机数，首次运行时生成，存进**操作系统钥匙串**
+//!   （macOS Keychain / Windows Credential Manager / Linux Secret Service）。
+//!   代码里不硬编码、不进数据库、不进日志。
+//! - **随机 nonce**：每次加密生成 12 字节随机 nonce，与密文一起存
+//!   （`nonce || ciphertext`）。**绝不复用 nonce**：GCM 下复用会灾难性地
+//!   泄露明文异或与认证密钥。
+//! - **不用口令派生**：主密钥本身就是高熵随机值，argon2 这类慢哈希只会让每次
+//!   启动变慢，并不提升安全性——攻击者拿到的是钥匙串里的密钥，不是弱口令。
 //!
-//! 在此之前，数据库里的密文不具保护意义——因此 Phase 4 完成前不应把本应用
-//! 当作「密钥安全存储」来宣传。
+//! # 数据库里存什么
+//!
+//! `key_cipher` = `nonce(12) || AES-GCM(明文)`，另有 `key_hint`（形如
+//! `user_…ab12`）供 UI 辨认。数据库泄露但拿不到钥匙串时，解不出明文。
+//!
+//! # 钥匙串不可用时
+//!
+//! 退化为「进程内存里的临时主密钥」并**打印醒目警告**：功能可用（能跑通对话），
+//! 但重启后旧密文解不开（会提示重新添加账号）。选择退化而非拒绝启动，是因为
+//! CI/容器/精简 Linux 上钥匙串常不可用，拒绝启动会让整个应用无法使用。
 
-/// 解密一个账号密钥。
-///
-/// 返回明文 API key（`user_` 开头）。解密失败返回 Err，调用方应跳过该账号
-/// 而不是让整个应用启动失败——一个坏账号不该阻止其他账号工作。
-pub fn decrypt_key(cipher: &[u8]) -> Result<String, SecretError> {
-    String::from_utf8(cipher.to_vec()).map_err(|e| SecretError::Corrupted(e.to_string()))
+use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+
+/// 钥匙串里的条目名。
+const KEYCHAIN_SERVICE: &str = "commandcode-desktop";
+/// 钥匙串里的账户名（同一 service 下区分用途）。
+const KEYCHAIN_ACCOUNT: &str = "master-key-v1";
+
+/// nonce 长度（AES-GCM 标准）。
+const NONCE_LEN: usize = 12;
+
+/// 密钥处理失败。
+#[derive(Debug, thiserror::Error)]
+pub enum SecretError {
+    /// 密文损坏、长度不足或认证失败（被篡改 / 主密钥不匹配）。
+    #[error("密钥数据无法解密：{0}")]
+    Corrupted(String),
 }
 
-/// 加密一个账号密钥（写库前调用）。
-pub fn encrypt_key(plaintext: &str) -> Result<Vec<u8>, SecretError> {
-    Ok(plaintext.as_bytes().to_vec())
+/// 主密钥的来源，用于日志与诊断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterKeySource {
+    /// 从系统钥匙串读取或写入。
+    Keychain,
+    /// 钥匙串不可用，退化为主进程内存中的临时密钥。
+    Ephemeral,
+}
+
+/// 处理后的主密钥持有者。
+///
+/// 在应用启动时构造一次，之后由 [Self::decrypt] / [Self::encrypt] 使用。
+/// 主密钥**只存在内存与钥匙串**，不写入任何自有文件。
+pub struct Secrets {
+    cipher: Aes256Gcm,
+    source: MasterKeySource,
+}
+
+impl Secrets {
+    /// 从系统钥匙串加载主密钥；不存在则生成并保存。
+    ///
+    /// 钥匙串不可用时退化为临时密钥（见模块文档的说明）。
+    pub fn load_or_create() -> Self {
+        match Self::load_or_create_inner() {
+            Ok(secrets) => {
+                tracing::info!(source = ?secrets.source, "账号密钥的主密钥已就绪");
+                secrets
+            }
+            Err(error) => {
+                // 钥匙串不可用不该是致命的：退化并明确告知后果
+                tracing::warn!(
+                    %error,
+                    "系统钥匙串不可用，本次运行使用内存中的临时主密钥；重启后需重新添加账号"
+                );
+                Self::ephemeral()
+            }
+        }
+    }
+
+    /// 用一把指定的主密钥构造（测试与显式注入用）。
+    pub fn from_bytes(key: [u8; 32], source: MasterKeySource) -> Self {
+        Self {
+            cipher: Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key)),
+            source,
+        }
+    }
+
+    /// 生成一把仅在本次进程有效的临时主密钥。
+    fn ephemeral() -> Self {
+        let key = Aes256Gcm::generate_key(&mut OsRng);
+        Self {
+            cipher: Aes256Gcm::new(&key),
+            source: MasterKeySource::Ephemeral,
+        }
+    }
+
+    /// 主密钥的来源。
+    pub fn source(&self) -> MasterKeySource {
+        self.source
+    }
+
+    /// 加密一个账号密钥，返回 `nonce || ciphertext`。
+    pub fn encrypt(&self, plaintext: &str) -> Result<Vec<u8>, SecretError> {
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let ciphertext = self
+            .cipher
+            .encrypt(&nonce, plaintext.as_bytes())
+            .map_err(|e| SecretError::Corrupted(format!("加密失败：{e}")))?;
+        let mut out = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+        out.extend_from_slice(&nonce);
+        out.extend_from_slice(&ciphertext);
+        Ok(out)
+    }
+
+    /// 解密一个账号密钥。
+    ///
+    /// 输入必须是 `nonce(12) || ciphertext`；长度不足或认证失败都返回错误，
+    /// 由调用方跳过该账号而不是让整个应用启动失败。
+    pub fn decrypt(&self, stored: &[u8]) -> Result<String, SecretError> {
+        if stored.len() <= NONCE_LEN {
+            return Err(SecretError::Corrupted(format!(
+                "密文长度 {} 不足（至少需要 {} 字节 nonce 加密文）",
+                stored.len(),
+                NONCE_LEN
+            )));
+        }
+        let (nonce_bytes, ciphertext) = stored.split_at(NONCE_LEN);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = self.cipher.decrypt(nonce, ciphertext).map_err(|_| {
+            // 不区分「认证失败」与「主密钥不匹配」：对用户都是「解不开」，
+            // 而更具体的原因可能被用来推断信息。
+            SecretError::Corrupted(
+                "认证失败（密文被篡改，或主密钥已变化——例如上次运行时钥匙串不可用）".to_string(),
+            )
+        })?;
+        String::from_utf8(plaintext).map_err(|e| SecretError::Corrupted(e.to_string()))
+    }
+
+    /// 从钥匙串读取主密钥；不存在则生成并写入。
+    fn load_or_create_inner() -> Result<Self, Box<dyn std::error::Error>> {
+        let entry = keyring::Entry::new(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?;
+        match entry.get_password() {
+            Ok(encoded) => {
+                let bytes = decode_hex(&encoded)?;
+                let key: [u8; 32] = bytes
+                    .try_into()
+                    .map_err(|_| "钥匙串里的主密钥长度不是 32 字节")?;
+                Ok(Self::from_bytes(key, MasterKeySource::Keychain))
+            }
+            Err(keyring::Error::NoEntry) => {
+                let key = Aes256Gcm::generate_key(&mut OsRng);
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&key);
+                entry.set_password(&encode_hex(&bytes))?;
+                Ok(Self::from_bytes(bytes, MasterKeySource::Keychain))
+            }
+            Err(other) => Err(Box::new(other)),
+        }
+    }
 }
 
 /// 生成密钥提示：`user_…ab12`。
@@ -45,23 +181,95 @@ pub fn key_hint(plaintext: &str) -> String {
     format!("{head}…{tail}")
 }
 
-/// 密钥处理失败。
-#[derive(Debug, thiserror::Error)]
-pub enum SecretError {
-    /// 密文损坏或格式不符。
-    #[error("密钥数据损坏：{0}")]
-    Corrupted(String),
+/// 字节串 → 十六进制（不引额外依赖，保持二进制体积）。
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 十六进制 → 字节串。
+fn decode_hex(text: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if !text.len().is_multiple_of(2) {
+        return Err("十六进制长度必须是偶数".into());
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| e.into()))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fixed_secrets() -> Secrets {
+        // 固定主密钥，让测试可重复
+        Secrets::from_bytes([7u8; 32], MasterKeySource::Keychain)
+    }
+
     #[test]
     fn encrypt_decrypt_roundtrip() {
+        let s = fixed_secrets();
         let key = "user_abcdefghijklmnop";
-        let cipher = encrypt_key(key).unwrap();
-        assert_eq!(decrypt_key(&cipher).unwrap(), key);
+        let cipher = s.encrypt(key).unwrap();
+        assert_eq!(s.decrypt(&cipher).unwrap(), key);
+    }
+
+    #[test]
+    fn ciphertext_does_not_contain_the_plaintext() {
+        let s = fixed_secrets();
+        let cipher = s.encrypt("user_supersecretvalue").unwrap();
+        let as_text = String::from_utf8_lossy(&cipher);
+        assert!(!as_text.contains("supersecret"), "密文里不得出现明文片段");
+        assert!(!as_text.contains("user_"), "密文里不得出现明文前缀");
+    }
+
+    #[test]
+    fn encryption_is_non_deterministic() {
+        let s = fixed_secrets();
+        let a = s.encrypt("user_same").unwrap();
+        let b = s.encrypt("user_same").unwrap();
+        // 每次加密用新的随机 nonce；相同明文不应产生相同密文
+        assert_ne!(a, b, "nonce 必须每次随机，否则 GCM 会灾难性泄露");
+        assert_eq!(a.len(), b.len(), "长度应一致（nonce 定长）");
+        assert_eq!(s.decrypt(&a).unwrap(), s.decrypt(&b).unwrap());
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails_authentication() {
+        let s = fixed_secrets();
+        let mut cipher = s.encrypt("user_abcdefghijkl").unwrap();
+        let last = cipher.len() - 1;
+        cipher[last] ^= 0x01;
+        assert!(s.decrypt(&cipher).is_err(), "GCM 认证必须发现篡改");
+    }
+
+    #[test]
+    fn wrong_master_key_fails_instead_of_returning_garbage() {
+        let a = Secrets::from_bytes([1u8; 32], MasterKeySource::Keychain);
+        let b = Secrets::from_bytes([2u8; 32], MasterKeySource::Keychain);
+        let cipher = a.encrypt("user_abcdefghijkl").unwrap();
+        assert!(
+            b.decrypt(&cipher).is_err(),
+            "换主密钥必须解密失败，而不是产出垃圾"
+        );
+    }
+
+    #[test]
+    fn short_ciphertext_is_rejected_without_panic() {
+        let s = fixed_secrets();
+        assert!(s.decrypt(&[]).is_err());
+        assert!(
+            s.decrypt(&[0u8; NONCE_LEN]).is_err(),
+            "只有 nonce 没有密文应被拒绝"
+        );
+        assert!(s.decrypt(&[0u8; 3]).is_err());
+    }
+
+    #[test]
+    fn empty_plaintext_roundtrips() {
+        let s = fixed_secrets();
+        let cipher = s.encrypt("").unwrap();
+        assert_eq!(s.decrypt(&cipher).unwrap(), "");
     }
 
     #[test]
@@ -70,7 +278,6 @@ mod tests {
         assert!(hint.starts_with("user_"), "保留前缀便于辨认类型");
         assert!(hint.ends_with("mnop"), "保留尾部便于区分不同 key");
         assert!(hint.contains('…'));
-        // 中间部分必须不可见
         assert!(!hint.contains("efgh"), "提示不得泄露中间字符：{hint}");
     }
 
@@ -80,11 +287,16 @@ mod tests {
     }
 
     #[test]
-    fn corrupted_cipher_is_an_error_not_a_panic() {
-        let bad = vec![0xff, 0xfe, 0xfd];
-        assert!(
-            decrypt_key(&bad).is_err(),
-            "坏密文应返回错误，由调用方跳过该账号"
-        );
+    fn hex_helpers_roundtrip() {
+        let bytes = [0u8, 1, 15, 16, 255];
+        assert_eq!(decode_hex(&encode_hex(&bytes)).unwrap(), bytes.to_vec());
+        assert!(decode_hex("abc").is_err(), "奇数长度应报错");
+        assert!(decode_hex("zz").is_err(), "非十六进制字符应报错");
+    }
+
+    #[test]
+    fn ephemeral_source_is_reported() {
+        let s = Secrets::from_bytes([9u8; 32], MasterKeySource::Ephemeral);
+        assert_eq!(s.source(), MasterKeySource::Ephemeral);
     }
 }

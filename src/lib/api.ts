@@ -67,7 +67,7 @@ export interface Health {
 
 /** 查询代理健康状态。 */
 export function getHealth(): Promise<Health> {
-  return getJson<Health>("/health");
+  return getJson<Health>("/api/health");
 }
 
 /** 新增账号的返回。 */

@@ -48,8 +48,8 @@ pub fn run() {
         ))
         .setup(|app| {
             let handle = app.handle().clone();
-            let (state, store) = match bootstrap::start(&handle) {
-                Ok(state) => state,
+            let (state, store, secrets) = match bootstrap::start(&handle) {
+                Ok(tuple) => tuple,
                 Err(error) => {
                     // 启动失败必须让用户看见原因，而不是留一个空窗口
                     tracing::error!(%error, "后台服务启动失败");
@@ -61,7 +61,7 @@ pub fn run() {
             // 它在页面任何 JS 之前执行，因此 React 的首个 fetch 就能带上 token
             // （若改用 build 之后的 eval，首屏请求会先发出并拿到 401）。
             let init_script = bootstrap::init_script(&state.control_base_url, &state.control_token);
-            WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
+            WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
                 .title("Command Code")
                 .inner_size(1100.0, 760.0)
                 .min_inner_size(820.0, 560.0)
@@ -69,8 +69,9 @@ pub fn run() {
                 .build()?;
 
             tray::install(&handle, &state)?;
-            // 存储句柄单独 manage：IPC 命令需要它，而它不属性 AppState 的职责
+            // 存储与密钥句柄单独 manage：IPC 命令需要它们
             app.manage(commands::StoreHandle(store));
+            app.manage(commands::SecretsHandle(secrets));
             app.manage(state);
             Ok(())
         })

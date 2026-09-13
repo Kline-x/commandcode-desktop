@@ -5,6 +5,9 @@ import react from "@vitejs/plugin-react";
 // （否则窗口会去加载一个不存在的地址，表现为白屏）
 export default defineConfig({
   plugins: [react()],
+  // 用相对路径：Tauri 在生产构建下通过自定义协议加载资源，
+  // 绝对路径（/assets/...）在部分平台会解析失败，表现为白屏。
+  base: "./",
   clearScreen: false,
   server: {
     port: 5173,

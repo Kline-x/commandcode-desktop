@@ -7,7 +7,7 @@
 
 use tauri::{AppHandle, Manager, State};
 
-use crate::secrets;
+use crate::secrets::Secrets;
 use crate::AppState;
 
 /// IPC 命令的错误：序列化成前端可读的字符串。
@@ -41,9 +41,17 @@ pub async fn add_account(
         return Err(CommandError::from("API key 不能为空".to_string()));
     }
 
-    let hint = secrets::key_hint(&api_key);
-    let cipher = secrets::encrypt_key(&api_key).map_err(|e| CommandError::from(e.to_string()))?;
     let store = store_of(&app)?;
+    // 主密钥由 bootstrap 在启动时加载并 manage，这里只借用
+    let secrets = app
+        .try_state::<SecretsHandle>()
+        .ok_or_else(|| CommandError::from("密钥服务尚未就绪".to_string()))?;
+
+    let hint = crate::secrets::key_hint(&api_key);
+    let cipher = secrets
+        .0
+        .encrypt(&api_key)
+        .map_err(|e| CommandError::from(e.to_string()))?;
 
     // 重复检测：同一 key 的提示相同
     match store.find_account_by_hint(&hint) {
@@ -119,3 +127,8 @@ fn store_of(app: &AppHandle) -> Result<std::sync::Arc<cc_server::store::Store>, 
 
 /// 存储句柄的 Tauri managed state 包装。
 pub struct StoreHandle(pub std::sync::Arc<cc_server::store::Store>);
+
+/// 密钥服务的 Tauri managed state 包装。
+///
+/// 用 Arc 持有：主密钥从钥匙串加载一次即固定，多个 IPC 调用共享同一实例。
+pub struct SecretsHandle(pub std::sync::Arc<Secrets>);

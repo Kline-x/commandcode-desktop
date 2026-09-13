@@ -28,6 +28,8 @@ pub struct ControlState {
     pub store: Arc<Store>,
     /// 本次启动生成的随机 token。
     pub token: String,
+    /// 上游基址。
+    pub api_base: String,
 }
 
 impl ControlState {
@@ -36,7 +38,14 @@ impl ControlState {
         Self {
             store,
             token: token.into(),
+            api_base: "https://api.commandcode.ai".into(),
         }
+    }
+
+    /// 设置上游基址。
+    pub fn with_api_base(mut self, api_base: impl Into<String>) -> Self {
+        self.api_base = api_base.into();
+        self
     }
 }
 
@@ -97,9 +106,35 @@ struct ControlError {
 }
 
 /// 构造控制面路由。`token` 为空时**不启用**鉴权（仅供单元测试）。
+///
+/// # 为什么需要 CORS
+///
+/// 生产构建下 WebView 的页面源是 `tauri://localhost`（macOS）或
+/// `http://tauri.localhost`（Windows），而控制面跑在 `http://127.0.0.1:<随机端口>`。
+/// 两者**不同源**，浏览器会强制 CORS：缺少响应头时 `fetch` 直接以
+/// `TypeError: Load failed` 失败（连状态码都拿不到），界面表现为「无法连接本地服务」。
+///
+/// 允许任意源是安全的，理由：
+/// - token 仍是必需项（见 [require_token]），别的网页拿不到它；
+/// - 端口每次启动随机；
+/// - 服务只监听回环地址。
+///
+/// 因此 CORS 在这里是「让本应用自己的页面能访问」，不是权限边界。
 pub fn control_router(state: Arc<ControlState>) -> Router {
+    use tower_http::cors::{Any, CorsLayer};
+
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        // 自定义头 x-control-token 必须显式放行，否则预检请求不通过
+        .allow_headers([
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderName::from_static("x-control-token"),
+        ]);
+
     Router::new()
         .route("/api/health", get(health))
+        .route("/health", get(health))
         .route("/api/accounts/list", post(list_accounts))
         .route("/api/accounts", post(create_account))
         .route("/api/accounts/{id}", patch(update_account))
@@ -107,7 +142,10 @@ pub fn control_router(state: Arc<ControlState>) -> Router {
         .route("/api/requests/recent", post(recent_requests))
         .route("/api/requests/insert", post(insert_request))
         .route("/api/settings/{key}", get(get_setting).put(set_setting))
+        // 路由层鉴权
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
+        // CORS 层在最外层包裹整个服务；预检请求由 CORS 层放行
+        .layer(cors)
         .with_state(state)
 }
 
@@ -117,8 +155,8 @@ async fn require_token(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if state.token.is_empty() {
-        // 测试路径：显式空 token 表示不校验
+    // 测试路径或 CORS 预检请求（OPTIONS）：不校验 token，交给 CORS 层处理
+    if state.token.is_empty() || request.method() == axum::http::Method::OPTIONS {
         return next.run(request).await;
     }
     let presented = request
@@ -154,7 +192,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// 健康检查。
 async fn health(State(state): State<Arc<ControlState>>) -> Response {
     let count = state.store.list_accounts().map(|a| a.len()).unwrap_or(0);
-    axum::Json(json!({ "status": "ok", "accounts": count })).into_response()
+    axum::Json(json!({
+        "status": "ok",
+        "accounts": count,
+        "api_base": state.api_base,
+    }))
+    .into_response()
 }
 
 /// 账号列表。
@@ -644,6 +687,62 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["value"], "3050");
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_for_accounts_list_passes() {
+        let app = control_router(state());
+        let response = tower::ServiceExt::oneshot(
+            app,
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/api/accounts/list")
+                .header("origin", "tauri://localhost")
+                .header("access-control-request-method", "POST")
+                .header(
+                    "access-control-request-headers",
+                    "content-type, x-control-token",
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get("access-control-allow-origin")
+                .unwrap(),
+            "*"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_return_api_base() {
+        let st = state();
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("GET").uri("/api/health"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["api_base"], "https://api.commandcode.ai");
+
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("GET").uri("/health"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ok");
+        assert_eq!(body["api_base"], "https://api.commandcode.ai");
     }
 
     #[test]

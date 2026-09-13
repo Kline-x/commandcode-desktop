@@ -29,6 +29,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
+# 账号密钥的加密：AES-256-GCM（认证加密，防篡改）
+aes-gcm = "0.10"
+# 主密钥派生：主密钥本身存在系统钥匙串，不需口令派生，故只用 sha2 做 KDF 混合
+sha2 = "0.10"
+# 系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service）
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 thiserror.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

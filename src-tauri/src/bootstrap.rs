@@ -42,7 +42,9 @@ pub enum StartupError {
 }
 
 /// 启动后台服务，返回给前端用的连接信息。
-pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
+pub fn start(
+    app: &AppHandle,
+) -> Result<(AppState, Arc<Store>, Arc<crate::secrets::Secrets>), StartupError> {
     let data_dir = data_dir(app)?;
     std::fs::create_dir_all(&data_dir).map_err(|e| StartupError::DataDir(e.to_string()))?;
 
@@ -63,7 +65,10 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
             reason: e.to_string(),
         })?;
 
-    let control_state = Arc::new(ControlState::new(store.clone(), control_token.clone()));
+    let control_state = Arc::new(
+        ControlState::new(store.clone(), control_token.clone())
+            .with_api_base("https://api.commandcode.ai"),
+    );
     let control_app = control_router(control_state);
 
     // 代理面：固定 127.0.0.1:3050（客户端要能预期这个地址）
@@ -82,7 +87,12 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
     // 从数据库读账号，构造 key 解析器。
     // 注意：**密文的解密在宿主层**（见 secrets.rs），本模块只做接线。
     let slots = load_slots(&store);
-    let key_lookup = Arc::new(load_key_map(&store));
+    // 主密钥在这里加载一次，之后由 AppState 与 IPC 命令共享
+    let secrets = Arc::new(crate::secrets::Secrets::load_or_create());
+    if secrets.source() == crate::secrets::MasterKeySource::Ephemeral {
+        tracing::warn!("本次运行使用临时主密钥：重启后需重新添加账号");
+    }
+    let key_lookup = Arc::new(load_key_map(&store, &secrets));
     let resolve_key: KeyResolver = {
         let map = key_lookup.clone();
         Arc::new(move |slot: &cc_server::AccountSlot| map.get(&slot.id).cloned())
@@ -190,6 +200,7 @@ pub fn start(app: &AppHandle) -> Result<(AppState, Arc<Store>), StartupError> {
             quota_shutdown,
         },
         store,
+        secrets,
     ))
 }
 
@@ -257,7 +268,10 @@ fn load_slots(store: &Store) -> Vec<cc_server::AccountSlot> {
 ///
 /// 这里调用 secrets 解密；当前实现把「密文即明文」的占位逻辑留在 secrets.rs，
 /// 接入 stronghold 后本函数无需改动。
-fn load_key_map(store: &Store) -> std::collections::HashMap<String, String> {
+fn load_key_map(
+    store: &Store,
+    secrets: &crate::secrets::Secrets,
+) -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     match store.list_accounts() {
         Ok(rows) => {
@@ -265,7 +279,7 @@ fn load_key_map(store: &Store) -> std::collections::HashMap<String, String> {
                 if !row.enabled {
                     continue;
                 }
-                match crate::secrets::decrypt_key(&row.key_cipher) {
+                match secrets.decrypt(&row.key_cipher) {
                     Ok(key) => {
                         map.insert(row.id.to_string(), key);
                     }
