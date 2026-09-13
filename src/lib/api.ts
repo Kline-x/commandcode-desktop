@@ -6,6 +6,8 @@
  * 只有本应用的 WebView 知道——这样本机其他网页无法通过回环地址读账号。
  */
 
+import { invoke } from "@tauri-apps/api/core";
+
 /** 控制 API 基址与 token 由 Tauri 注入到 window。 */
 declare global {
   interface Window {
@@ -66,4 +68,22 @@ export interface Health {
 /** 查询代理健康状态。 */
 export function getHealth(): Promise<Health> {
   return getJson<Health>("/health");
+}
+
+/** 新增账号的返回。 */
+export interface AddAccountResult {
+  id: number;
+  key_hint: string;
+}
+
+/**
+ * 新增一个账号。
+ *
+ * **走 Tauri IPC 而不是控制面 HTTP**：明文密钥的加密必须发生在 Rust 侧。
+ * 若让前端自己调 `/api/accounts`，它就得自己加密——等于把加密逻辑与主密钥
+ * 暴露给 WebView。这里把明文交给 Rust，加密与落库都在那边完成，
+ * 返回值里只有提示（形如 `user_…ab12`）。
+ */
+export function addAccount(label: string, apiKey: string): Promise<AddAccountResult> {
+  return invoke<AddAccountResult>("add_account", { label, apiKey });
 }

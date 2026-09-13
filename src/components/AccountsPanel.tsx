@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { sendJson } from "../lib/api";
+import { addAccount, sendJson } from "../lib/api";
 
 /** 一个账号在控制面上的形状。 */
 interface AccountView {
@@ -8,21 +8,24 @@ interface AccountView {
   label: string;
   key_hint: string;
   enabled: boolean;
-  plan_id: string | null;
+  quota: unknown;
   last_error: string | null;
   last_checked_ms: number | null;
 }
 
 /**
- * 账号面板。
+ * 账号面板：清单 + 添加表单。
  *
- * 额度进度条在 Phase 3 接入控制 API 后补齐；当前先展示账号清单与错误状态，
- * 让「代理有哪些账号可用」这件事在界面上可见。
+ * 添加走 Tauri IPC（`addAccount`）而不是控制面 HTTP——明文密钥的加密必须
+ * 发生在 Rust 侧，见 lib/api.ts 的说明。输入框在提交后立即清空。
  */
 export function AccountsPanel(): React.JSX.Element {
   const [accounts, setAccounts] = useState<AccountView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  const [label, setLabel] = useState("");
+  const [apiKey, setApiKey] = useState("");
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -39,6 +42,29 @@ export function AccountsPanel(): React.JSX.Element {
     void load();
   }, [load]);
 
+  const submit = useCallback(
+    async (event: React.FormEvent): Promise<void> => {
+      event.preventDefault();
+      if (busy) {
+        return;
+      }
+      setBusy(true);
+      setError(null);
+      try {
+        await addAccount(label, apiKey);
+        // 提交成功后立刻清空密钥输入：明文不该在界面里多停留一秒
+        setApiKey("");
+        setLabel("");
+        await load();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [busy, label, apiKey, load],
+  );
+
   const toggle = useCallback(
     async (id: number, enabled: boolean): Promise<void> => {
       setBusy(true);
@@ -54,15 +80,54 @@ export function AccountsPanel(): React.JSX.Element {
     [load],
   );
 
+  const remove = useCallback(
+    async (id: number): Promise<void> => {
+      setBusy(true);
+      try {
+        await sendJson("DELETE", `/api/accounts/${id}`);
+        await load();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [load],
+  );
+
   return (
     <section className="panel">
       <h2 className="panel__title">账号</h2>
-      {error !== null && <p className="panel__hint">读取失败：{error}</p>}
+
+      <form className="form" onSubmit={(event) => void submit(event)}>
+        <input
+          className="form__input"
+          placeholder="名称（例如 Go #1）"
+          value={label}
+          onChange={(event) => setLabel(event.target.value)}
+          disabled={busy}
+        />
+        <input
+          className="form__input form__input--wide"
+          placeholder="Command Code API key（user_ 开头）"
+          type="password"
+          value={apiKey}
+          onChange={(event) => setApiKey(event.target.value)}
+          disabled={busy}
+        />
+        <button type="submit" disabled={busy || label.trim() === "" || apiKey.trim() === ""}>
+          添加
+        </button>
+      </form>
+
+      {error !== null && <p className="panel__hint panel__hint--err">操作失败：{error}</p>}
+
       {accounts === null ? (
         <p className="panel__hint">加载中…</p>
       ) : accounts.length === 0 ? (
         <p className="panel__hint">
-          还没有账号。添加一个 Command Code API key（user_ 开头）后即可开始使用。
+          还没有账号。添加一个 Command Code API key 后，本机任意 OpenAI / Anthropic
+          客户端就能通过下面的端点使用它，额度耗尽时会自动切换到下一个账号。
         </p>
       ) : (
         <table>
@@ -70,7 +135,6 @@ export function AccountsPanel(): React.JSX.Element {
             <tr>
               <th>名称</th>
               <th>密钥</th>
-              <th>套餐</th>
               <th>状态</th>
               <th />
             </tr>
@@ -80,8 +144,9 @@ export function AccountsPanel(): React.JSX.Element {
               <tr key={account.id}>
                 <td>{account.label}</td>
                 <td>{account.key_hint}</td>
-                <td>{account.plan_id ?? "—"}</td>
-                <td>{account.last_error ?? (account.enabled ? "可用" : "已停用")}</td>
+                <td>
+                  {account.last_error ?? (account.enabled ? "可用" : "已停用")}
+                </td>
                 <td className="num">
                   <button
                     type="button"
@@ -89,6 +154,9 @@ export function AccountsPanel(): React.JSX.Element {
                     onClick={() => void toggle(account.id, !account.enabled)}
                   >
                     {account.enabled ? "停用" : "启用"}
+                  </button>{" "}
+                  <button type="button" disabled={busy} onClick={() => void remove(account.id)}>
+                    删除
                   </button>
                 </td>
               </tr>
