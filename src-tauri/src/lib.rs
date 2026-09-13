@@ -66,6 +66,7 @@ pub fn run() {
                 .inner_size(1100.0, 760.0)
                 .min_inner_size(820.0, 560.0)
                 .initialization_script(&init_script)
+                .devtools(true)
                 .build()?;
 
             tray::install(&handle, &state)?;

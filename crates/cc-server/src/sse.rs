@@ -78,11 +78,59 @@ impl Usage {
     /// Anthropic 侧的 cache_read 是独立增量，两者语义相反）。
     pub fn from_json(value: &Value) -> Option<Self> {
         let obj = value.as_object()?;
-        let num = |key: &str| obj.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let num = |v: Option<&Value>| -> u64 {
+            match v {
+                Some(Value::Number(n)) => n
+                    .as_u64()
+                    .or_else(|| n.as_f64().map(|f| f as u64))
+                    .unwrap_or(0),
+                Some(Value::String(s)) => s.parse::<u64>().unwrap_or(0),
+                _ => 0,
+            }
+        };
+
+        let input_tokens = num(obj.get("inputTokens"))
+            .max(num(obj.get("input_tokens")))
+            .max(num(obj.get("prompt_tokens")));
+
+        let output_tokens = num(obj.get("outputTokens"))
+            .max(num(obj.get("output_tokens")))
+            .max(num(obj.get("completion_tokens")));
+
+        // 缓存 token：兼容 camelCase、snake_case 以及 inputTokenDetails / prompt_tokens_details 嵌套对象
+        let cached_input_tokens = {
+            let direct = num(obj.get("cachedInputTokens"))
+                .max(num(obj.get("cached_input_tokens")))
+                .max(num(obj.get("cachedTokens")))
+                .max(num(obj.get("cached_tokens")))
+                .max(num(obj.get("cacheReadTokens")))
+                .max(num(obj.get("cache_read_input_tokens")));
+            if direct > 0 {
+                direct
+            } else if let Some(details) = obj
+                .get("inputTokenDetails")
+                .or_else(|| obj.get("input_token_details"))
+                .and_then(Value::as_object)
+            {
+                num(details.get("cacheReadTokens"))
+                    .max(num(details.get("cache_read_tokens")))
+                    .max(num(details.get("cachedTokens")))
+                    .max(num(details.get("cached_tokens")))
+            } else if let Some(details) = obj
+                .get("promptTokensDetails")
+                .or_else(|| obj.get("prompt_tokens_details"))
+                .and_then(Value::as_object)
+            {
+                num(details.get("cachedTokens")).max(num(details.get("cached_tokens")))
+            } else {
+                0
+            }
+        };
+
         Some(Self {
-            input_tokens: num("inputTokens"),
-            output_tokens: num("outputTokens"),
-            cached_input_tokens: num("cachedInputTokens"),
+            input_tokens,
+            output_tokens,
+            cached_input_tokens,
         })
     }
 
@@ -320,6 +368,38 @@ mod tests {
             cached_input_tokens: 50,
         };
         assert_eq!(ok.normalized(), ok);
+    }
+
+    #[test]
+    fn usage_parses_cached_tokens_from_nested_and_snake_case_fields() {
+        // 1. camelCase inputTokenDetails.cacheReadTokens
+        let u1 = Usage::from_json(&json!({
+            "inputTokens": 100,
+            "outputTokens": 20,
+            "inputTokenDetails": { "cacheReadTokens": 45 }
+        }))
+        .unwrap();
+        assert_eq!(u1.cached_input_tokens, 45);
+
+        // 2. prompt_tokens_details.cached_tokens
+        let u2 = Usage::from_json(&json!({
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "prompt_tokens_details": { "cached_tokens": 80 }
+        }))
+        .unwrap();
+        assert_eq!(u2.input_tokens, 120);
+        assert_eq!(u2.output_tokens, 30);
+        assert_eq!(u2.cached_input_tokens, 80);
+
+        // 3. direct snake_case cached_input_tokens
+        let u3 = Usage::from_json(&json!({
+            "input_tokens": 50,
+            "output_tokens": 10,
+            "cached_input_tokens": 25
+        }))
+        .unwrap();
+        assert_eq!(u3.cached_input_tokens, 25);
     }
 
     #[test]

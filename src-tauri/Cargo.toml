@@ -21,7 +21,7 @@ tauri-build = { version = "2", features = [] }
 # 核心逻辑全部在 cc-server 里（平台无关，可在 Linux CI 独立测试）
 axum = "0.8"
 cc-server = { path = "../crates/cc-server" }
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "devtools"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
