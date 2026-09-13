@@ -44,9 +44,9 @@ export interface AccountView {
   last_checked_ms: number | null;
 }
 
-function fmtCredits(v: number | null | undefined): string {
+function fmtMoney(v: number | null | undefined): string {
   if (v == null || isNaN(v)) return "—";
-  return Number.isInteger(v) ? String(v) : v.toFixed(1);
+  return `$${Number.isInteger(v) ? String(v) : v.toFixed(1)}`;
 }
 
 function formatDuration(seconds: number | null | undefined): string {
@@ -100,11 +100,11 @@ function WindowBar({ label, w, note = "" }: WindowProps): React.JSX.Element | nu
       </div>
       <div className="window-detail">
         <span>
-          已用 {fmtCredits(w.used)} / {fmtCredits(w.cap)}
+          已用 {fmtMoney(w.used)} / {fmtMoney(w.cap)}
           {w.exceeded ? <span className="warn"> 已用满</span> : ""}
         </span>
         <span className="left" style={{ color }}>
-          剩余 {fmtCredits(Math.max(w.cap - w.used, 0))}
+          剩余 {fmtMoney(Math.max(w.cap - w.used, 0))}
         </span>
       </div>
       <div className="window-detail" style={{ marginTop: 2 }}>
@@ -226,13 +226,13 @@ export function AccountCard({
 
       <div className="bal-row">
         <span className="bal">
-          月度剩余 <b>{fmtCredits(credits?.monthly)}</b>
+          月度剩余 <b>{fmtMoney(credits?.monthly)}</b>
         </span>
         <span className="bal">
-          充值余额 <b>{fmtCredits(credits?.purchased)}</b>
+          充值余额 <b>{fmtMoney(credits?.purchased)}</b>
         </span>
         <span className="bal">
-          免费额度 <b>{fmtCredits(credits?.free)}</b>
+          免费额度 <b>{fmtMoney(credits?.free)}</b>
         </span>
       </div>
 

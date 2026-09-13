@@ -43,6 +43,64 @@ pub type KeyResolver = Arc<dyn Fn(&AccountSlot) -> Option<String> + Send + Sync>
 /// 请求完成后的回调（用于落库与推送到 UI）。
 pub type RequestObserver = Arc<dyn Fn(RequestRecord) + Send + Sync>;
 
+/// 计算本次请求预估的消耗金额（美元）。
+///
+/// 价格参考主流模型公开定价（按 1M tokens 换算）。
+/// 包含未缓存输入、提示词缓存命中输入（通常 10%~50% 成本）、输出补全三部分。
+pub fn estimate_cost_usd(
+    model: &str,
+    status: u16,
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_tokens: u64,
+) -> f64 {
+    if status >= 400 || (input_tokens == 0 && output_tokens == 0) {
+        return 0.0;
+    }
+    let m = model.to_lowercase();
+    // (input_per_m, cached_input_per_m, output_per_m)
+    let (p_in, p_cache, p_out) = if m.contains("claude-3-7-sonnet")
+        || m.contains("claude-3.7-sonnet")
+        || m.contains("claude-3-5-sonnet")
+        || m.contains("claude-3.5-sonnet")
+    {
+        (3.0, 0.30, 15.0)
+    } else if m.contains("claude-3-5-haiku") || m.contains("claude-3-haiku") {
+        (0.80, 0.08, 4.0)
+    } else if m.contains("claude-3-opus") {
+        (15.0, 1.50, 75.0)
+    } else if m.contains("gpt-4o-mini") {
+        (0.15, 0.075, 0.60)
+    } else if m.contains("gpt-4o") {
+        (2.50, 1.25, 10.0)
+    } else if m.contains("o1-mini") || m.contains("o3-mini") {
+        (1.10, 0.55, 4.40)
+    } else if m.contains("o1") {
+        (15.0, 7.50, 60.0)
+    } else if m.contains("deepseek-v4-pro")
+        || m.contains("deepseek-reasoner")
+        || m.contains("deepseek-r1")
+    {
+        (0.55, 0.14, 2.19)
+    } else if m.contains("deepseek-v4-flash")
+        || m.contains("deepseek-chat")
+        || m.contains("deepseek-v3")
+    {
+        (0.14, 0.014, 0.28)
+    } else if m.contains("gemini-2.0-flash") || m.contains("gemini-1.5-flash") {
+        (0.10, 0.025, 0.40)
+    } else if m.contains("gemini-2.0-pro") || m.contains("gemini-1.5-pro") {
+        (1.25, 0.3125, 5.00)
+    } else {
+        // 兜底常用均价：$1.0 / M in, $0.25 / M cache, $3.0 / M out
+        (1.0, 0.25, 3.0)
+    };
+
+    let uncached_in = input_tokens.saturating_sub(cached_tokens);
+    (uncached_in as f64 * p_in + cached_tokens as f64 * p_cache + output_tokens as f64 * p_out)
+        / 1_000_000.0
+}
+
 /// 一次请求的结果记录。
 #[derive(Debug, Clone)]
 pub struct RequestRecord {
@@ -50,10 +108,14 @@ pub struct RequestRecord {
     pub at_ms: i64,
     /// 使用的账号槽位 id。
     pub account_id: String,
+    /// 使用的账号展示名。
+    pub account_label: String,
     /// 模型。
     pub model: String,
     /// 上游通道。
     pub protocol: &'static str,
+    /// 客户端协议（openai_chat / anthropic / openai_responses）。
+    pub client_protocol: &'static str,
     /// 是否流式。
     pub stream: bool,
     /// 最终 HTTP 状态。
@@ -68,6 +130,8 @@ pub struct RequestRecord {
     pub ttft_ms: Option<i64>,
     /// 总耗时（毫秒）。
     pub total_ms: i64,
+    /// 预估消耗金额（美元）。
+    pub cost_usd: f64,
 }
 
 /// 代理服务的共享状态。
@@ -188,6 +252,7 @@ pub fn router(state: Arc<ProxyState>) -> Router {
         .route("/v1/v1/messages", post(messages))
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
+        .route("/v1/v1/responses", post(responses))
         .with_state(state)
 }
 
@@ -263,6 +328,24 @@ async fn chat_completions(
             );
         }
     };
+    // 智能嗅探：若带有 anthropic-version 请求头，说明客户端误将 Anthropic Base URL 配置到了 /v1/chat/completions
+    if headers.contains_key("anthropic-version") {
+        let converted = match crate::anthropic::anthropic_to_openai(&request) {
+            Ok(c) => c,
+            Err(e) => return error_response(&e, ErrorEnvelope::Anthropic),
+        };
+        return run_generation(state, headers, converted, PublicProtocol::Anthropic).await;
+    }
+
+    // 智能嗅探：若请求体包含 input 且无 messages，说明客户端以 Responses API 结构发送至此
+    if request.get("input").is_some() && request.get("messages").is_none() {
+        let converted = match crate::responses::convert_responses_to_chat(&request) {
+            Ok(c) => c,
+            Err(e) => return error_response(&e, ErrorEnvelope::OpenAi),
+        };
+        return run_generation(state, headers, converted, PublicProtocol::Responses).await;
+    }
+
     // OpenAI 形状直接进入统一生成流程
     run_generation(state, headers, request, PublicProtocol::OpenAi).await
 }
@@ -366,6 +449,7 @@ async fn run_generation(
                 &placeholder,
                 &model,
                 UpstreamProtocol::Auto,
+                public,
                 stream,
                 &e,
                 &UsageTotals::default(),
@@ -471,6 +555,7 @@ async fn run_generation(
                         &current,
                         &model,
                         protocol,
+                        public,
                         stream,
                         &final_error,
                         &usage_totals,
@@ -486,6 +571,7 @@ async fn run_generation(
                         &current,
                         &model,
                         protocol,
+                        public,
                         stream,
                         &error,
                         &usage_totals,
@@ -524,6 +610,7 @@ async fn run_generation(
                             &current,
                             &model,
                             protocol,
+                            public,
                             stream,
                             &e,
                             &usage_totals,
@@ -571,11 +658,20 @@ async fn run_generation(
                     events.usage().as_ref(),
                 ),
             };
+            let cost_usd = estimate_cost_usd(
+                &model,
+                200,
+                usage_totals.input_tokens,
+                usage_totals.output_tokens,
+                usage_totals.cached_input_tokens,
+            );
             let record_ok = RequestRecord {
                 at_ms: now_ms(),
                 account_id: current.slot.id.clone(),
+                account_label: current.slot.label.clone(),
                 model: model.clone(),
                 protocol: protocol_name(protocol),
+                client_protocol: public.as_str(),
                 stream,
                 status: 200,
                 error_code: None,
@@ -583,6 +679,7 @@ async fn run_generation(
                 attempts: rotation.attempted(),
                 ttft_ms: Some(now_ms() - started),
                 total_ms: now_ms() - started,
+                cost_usd,
             };
             if let Some(observer) = &state.observer {
                 observer(record_ok);
@@ -658,11 +755,20 @@ async fn run_generation(
                                 }
                             }
                         }
+                        let cost_usd = estimate_cost_usd(
+                            &model_for_record,
+                            200,
+                            totals.input_tokens,
+                            totals.output_tokens,
+                            totals.cached_input_tokens,
+                        );
                         let rec = RequestRecord {
                             at_ms: now_ms(),
                             account_id: account.slot.id.clone(),
+                            account_label: account.slot.label.clone(),
                             model: model_for_record.clone(),
                             protocol: protocol_name,
+                            client_protocol: public.as_str(),
                             stream: true,
                             status: 200,
                             error_code: Some(e.code().to_string()),
@@ -670,6 +776,7 @@ async fn run_generation(
                             attempts: rotation.attempted(),
                             ttft_ms,
                             total_ms: now_ms() - started,
+                            cost_usd,
                         };
                         if let Some(observer) = &stream_state.observer {
                             observer(rec);
@@ -716,11 +823,20 @@ async fn run_generation(
                     }
                 }
             }
+            let cost_usd = estimate_cost_usd(
+                &model_for_record,
+                200,
+                totals.input_tokens,
+                totals.output_tokens,
+                totals.cached_input_tokens,
+            );
             let rec = RequestRecord {
                 at_ms: now_ms(),
                 account_id: account.slot.id.clone(),
+                account_label: account.slot.label.clone(),
                 model: model_for_record.clone(),
                 protocol: protocol_name,
+                client_protocol: public.as_str(),
                 stream: true,
                 status: 200,
                 error_code: None,
@@ -728,6 +844,7 @@ async fn run_generation(
                 attempts: rotation.attempted(),
                 ttft_ms,
                 total_ms: now_ms() - started,
+                cost_usd,
             };
             if let Some(observer) = &stream_state.observer {
                 observer(rec);
@@ -751,6 +868,7 @@ async fn run_generation(
         &current,
         &model,
         protocol,
+        public,
         stream,
         &error,
         &usage_totals,
@@ -780,6 +898,7 @@ fn record(
     account: &ResolvedAccount,
     model: &str,
     protocol: UpstreamProtocol,
+    client_protocol: PublicProtocol,
     stream: bool,
     error: &CcError,
     usage: &UsageTotals,
@@ -790,18 +909,29 @@ fn record(
     let Some(observer) = &state.observer else {
         return;
     };
+    let status = error.http_status();
+    let cost_usd = estimate_cost_usd(
+        model,
+        status,
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cached_input_tokens,
+    );
     observer(RequestRecord {
         at_ms: now_ms(),
         account_id: account.slot.id.clone(),
+        account_label: account.slot.label.clone(),
         model: model.to_string(),
         protocol: protocol_name(protocol),
+        client_protocol: client_protocol.as_str(),
         stream,
-        status: error.http_status(),
+        status,
         error_code: Some(error.code().to_string()),
         usage: *usage,
         attempts,
         ttft_ms,
         total_ms: now_ms() - started,
+        cost_usd,
     });
 }
 

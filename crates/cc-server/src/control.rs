@@ -180,12 +180,16 @@ pub struct RequestView {
     pub id: i64,
     /// 时刻。
     pub at_ms: i64,
-    /// 账号。
+    /// 账号 id。
     pub account_id: String,
+    /// 账号展示名（备注）。
+    pub account_label: Option<String>,
     /// 模型。
     pub model: String,
-    /// 通道。
+    /// 上游通道。
     pub protocol: String,
+    /// 客户端协议。
+    pub client_protocol: String,
     /// 是否流式。
     pub stream: bool,
     /// 状态码。
@@ -202,6 +206,8 @@ pub struct RequestView {
     pub ttft_ms: Option<i64>,
     /// 总耗时。
     pub total_ms: i64,
+    /// 预估消耗金额（美元）。
+    pub cost_usd: f64,
 }
 
 /// 控制面错误信封。
@@ -648,8 +654,10 @@ fn to_request_view(row: crate::store::RequestRow) -> RequestView {
         id: row.id,
         at_ms: row.at_ms,
         account_id: row.account_id,
+        account_label: row.account_label,
         model: row.model,
         protocol: row.protocol,
+        client_protocol: row.client_protocol,
         stream: row.stream,
         status: row.status,
         error_code: row.error_code,
@@ -658,6 +666,7 @@ fn to_request_view(row: crate::store::RequestRow) -> RequestView {
         cached_tokens: row.cached_tokens,
         ttft_ms: row.ttft_ms,
         total_ms: row.total_ms,
+        cost_usd: row.cost_usd,
     }
 }
 

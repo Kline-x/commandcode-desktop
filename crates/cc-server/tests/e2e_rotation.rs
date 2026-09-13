@@ -51,12 +51,24 @@ async fn post_chat(state: Arc<ProxyState>, body: Value) -> (StatusCode, String) 
 
 /// 向指定路径发一次 POST，返回 (状态码, 响应体文本)。
 async fn post_to(state: Arc<ProxyState>, uri: &str, body: Value) -> (StatusCode, String) {
+    post_to_with_headers(state, uri, vec![], body).await
+}
+
+/// 向指定路径带自定义 Header 发一次 POST。
+async fn post_to_with_headers(
+    state: Arc<ProxyState>,
+    uri: &str,
+    headers: Vec<(&'static str, &'static str)>,
+    body: Value,
+) -> (StatusCode, String) {
     let app = router(state);
+    let mut builder = Request::builder().method("POST").uri(uri);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
     let response = app
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
+            builder
                 .header("content-type", "application/json")
                 .body(Body::from(body.to_string()))
                 .unwrap(),
@@ -336,8 +348,10 @@ async fn observer_records_each_request() {
     let recs = records.lock().unwrap();
     assert_eq!(recs.len(), 1, "每次请求都应上报一条记录");
     assert_eq!(recs[0].account_id, "default");
+    assert_eq!(recs[0].account_label, "Default");
     assert_eq!(recs[0].model, "deepseek/deepseek-v4-flash");
     assert_eq!(recs[0].protocol, "cli");
+    assert_eq!(recs[0].client_protocol, "openai_chat");
     assert!(recs[0].stream);
     assert_eq!(recs[0].error_code, None);
 }
@@ -661,4 +675,103 @@ async fn responses_stream_emits_responses_events() {
     assert!(body.contains("event: response.output_item.added"));
     assert!(body.contains("event: response.output_text.delta"));
     assert!(body.contains("event: response.completed"));
+}
+
+#[tokio::test]
+async fn client_protocol_is_accurately_recorded_for_all_protocols() {
+    let records: Arc<std::sync::Mutex<Vec<cc_server::RequestRecord>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = records.clone();
+    let observer: cc_server::RequestObserver = Arc::new(move |rec| sink.lock().unwrap().push(rec));
+
+    let mock = MockUpstream::start([
+        MockResponse::StreamSuccess {
+            text: "msg1".into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "msg2".into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "msg3".into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "msg4".into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "msg5".into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "msg6".into(),
+        },
+    ])
+    .await;
+    let state = Arc::new(
+        ProxyState::new(config_for(mock.base_url()), two_slots(), resolver())
+            .unwrap()
+            .with_observer(observer),
+    );
+
+    // 1. OpenAI Chat: /v1/chat/completions -> openai_chat
+    let (s1, b1) = post_to(
+        state.clone(),
+        "/v1/chat/completions",
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": false}),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "s1 failed: {b1}");
+
+    // 2. Anthropic Messages: /v1/messages -> anthropic
+    let (s2, _) = post_to(
+        state.clone(),
+        "/v1/messages",
+        json!({"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "stream": false}),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+
+    // 3. Responses API: /v1/responses -> openai_responses (带有容错输入结构：无 type: message)
+    let (s3, _) = post_to(
+        state.clone(),
+        "/v1/responses",
+        json!({"model": "m", "input": [{"role": "user", "content": "hi"}], "stream": false}),
+    )
+    .await;
+    assert_eq!(s3, StatusCode::OK);
+
+    // 4. Responses 容错路径: /v1/v1/responses -> openai_responses
+    let (s4, _) = post_to(
+        state.clone(),
+        "/v1/v1/responses",
+        json!({"model": "m", "input": "string input", "stream": false}),
+    )
+    .await;
+    assert_eq!(s4, StatusCode::OK);
+
+    // 5. 智能嗅探：发往 /v1/chat/completions 但请求体为 Responses input 结构 -> openai_responses
+    let (s5, _) = post_to(
+        state.clone(),
+        "/v1/chat/completions",
+        json!({"model": "m", "input": "responses input via chat completions endpoint", "stream": false}),
+    )
+    .await;
+    assert_eq!(s5, StatusCode::OK);
+
+    // 6. 智能嗅探：发往 /v1/chat/completions 但带 anthropic-version 请求头 -> anthropic
+    let (s6, _) = post_to_with_headers(
+        state.clone(),
+        "/v1/chat/completions",
+        vec![("anthropic-version", "2023-06-01")],
+        json!({"model": "m", "max_tokens": 100, "messages": [{"role": "user", "content": "hi"}], "stream": false}),
+    )
+    .await;
+    assert_eq!(s6, StatusCode::OK);
+
+    let recs = records.lock().unwrap();
+    assert_eq!(recs.len(), 6);
+    assert_eq!(recs[0].client_protocol, "openai_chat");
+    assert_eq!(recs[1].client_protocol, "anthropic");
+    assert_eq!(recs[2].client_protocol, "openai_responses");
+    assert_eq!(recs[3].client_protocol, "openai_responses");
+    assert_eq!(recs[4].client_protocol, "openai_responses");
+    assert_eq!(recs[5].client_protocol, "anthropic");
 }
