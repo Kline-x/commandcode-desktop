@@ -99,6 +99,63 @@
 
 ---
 
+## 4.5 实施状态（截至当前提交）
+
+### 已落地
+
+| 模块 | 文件 | 测试 |
+|---|---|---|
+| 错误语义与轮换判定 | `error.rs` | 9 |
+| 上游事件解析 | `sse.rs` | 11 |
+| 账号池与轮换状态机 | `pool.rs` | 28 |
+| 连接配置 | `config.rs` | 1 |
+| 请求转换 | `convert.rs` | 33 |
+| 上游 HTTP 客户端 | `upstream.rs` | 10 |
+| OpenAI SSE 翻译 | `openai.rs` | 13 |
+| Anthropic 协议面 | `anthropic.rs` | 52 |
+| 配额解析 | `quota.rs` | 33 |
+| 配额轮询器 | `quota_poller.rs` | 16 |
+| 本地代理服务 | `proxy.rs` | 7 |
+| 控制 API | `control.rs` | 10 |
+| SQLite 存储 | `store.rs` | 15 |
+| 时间工具 | `time.rs` | 3 |
+| mock 上游 | `mock_upstream.rs` | 10 |
+| 端到端（错误矩阵 + 双协议） | `tests/e2e_rotation.rs` | 16 |
+| **合计** | | **≈275** |
+
+产物：`Command Code.app`（18 MB）+ `.dmg`（5.9 MB），本机 arm64 实测可运行。
+
+### 与计划的偏差
+
+| 计划 | 实际 | 原因 |
+|---|---|---|
+| `tauri-plugin-stronghold` 存主密钥 | **`keyring` + AES-256-GCM** | stronghold 需要口令派生（每次启动要用户交互）；`keyring` 直接对接系统钥匙串（macOS Keychain / Windows Credential Manager / Linux Secret Service），无交互。AES-GCM 提供认证加密，篡改即失败 |
+| 单 crate `cc-server` 内分 `proxy/upstream/...` 子模块 | 顶层平铺 `proxy.rs`/`upstream.rs`/... | 模块数量与耦合度都还不需要目录层级；平铺更易导航，将来变大再拆 |
+| 控制面走 HTTP 供前端读写 | 读走 HTTP，**写（增删账号）走 Tauri IPC** | 明文密钥的加密必须发生在 Rust 侧。若让前端调 HTTP 写接口，它就得自己加密——等于把加密逻辑与主密钥暴露给 WebView |
+
+### 真机运行才暴露的缺陷（单测不可能发现）
+
+这一节值得单独记录：下面每个问题都让应用**完全不可用**，而 `cargo test` 全绿。
+
+| # | 症状 | 根因 |
+|---|---|---|
+| 1 | 启动即 abort | `tauri.conf.json` 声明了窗口，`setup()` 又建同名窗口 → `webview with label main already exists` |
+| 2 | 端口在 LISTEN 但无任何响应 | std `TcpListener` 未设 `nonblocking`，`axum::serve` 的 async accept 阻塞式占死运行时线程 |
+| 3 | 上一条的连带 | `TcpListener::from_std` 必须在**运行时上下文内**调用（`setup` 钩子跑在主线程、无运行时） |
+| 4 | 窗口全白 | Vite 产出绝对路径 `/assets/...`，Tauri 自定义协议下解析失败 → 改 `base: "./"` |
+| 5 | 窗口全白（另一种） | 缺 `src-tauri/capabilities/default.json`（Tauri 2 的权限声明） |
+| 6 | 界面 `Load failed` | WebView 页面源 `tauri://localhost` 与控制面 `http://127.0.0.1:<随机端口>` 跨源，缺 CORS 头时 fetch 直接失败 |
+| 7 | 加 CORS 后变 401 | 层序错误：axum 中**后应用的在更外层**，CORS 被放在鉴权内层，OPTIONS 预检先被拒 |
+| 8 | 界面持续 404 | 前端把控制面的 `/api/health` 写成了代理面的 `/health` |
+| 9 | 请求流水永远为空 | `ProxyState::with_observer` 从未被调用——模块有测试但没接线 |
+| 10 | 账号额度永远是初始值 | `QuotaPoller::run()` 从未被调用 |
+
+**教训**：`cargo build` 通过、单测全绿，都不等于「能跑」。凡是跨进程边界
+（Tauri 生命周期、自定义协议、CORS、运行时上下文）的缺陷，只能靠真机运行发现。
+因此每个 Phase 的验收都必须包含一次「实际启动并观察」。
+
+---
+
 ## 5. 模块映射（JS → Rust）
 
 ```
@@ -173,54 +230,60 @@ commandcode-desktop/
 
 - [x] 建仓库、MIT LICENSE、.gitignore、README、THIRD_PARTY.md
 - [x] 记录上游 commit hash 到 `third_party/upstream.json`
-- [ ] Tauri 2 模板 + React/Vite 前端跑通空白窗口
-- [ ] `axum` 起 `/health`，端口可配
-- [ ] `scripts/mock-upstream.mjs`：可注入 401 / 402 / 429 / 403 / 正常流
-- [ ] CI 矩阵骨架（三平台 `cargo check`）
+- [x] Tauri 2 模板 + React/Vite 前端跑通空白窗口
+- [x] `axum` 起 `/health`，端口可配
+- [x] mock 上游：改用 Rust 实现（`src/mock_upstream.rs`，真实 axum 服务器，
+      支持 401/402/429/403 upgrade_required/正常流/中途断流/挂起）
+- [x] CI 矩阵骨架（三平台 `cargo check`）
 
 **验收**：`pnpm tauri dev` 出窗口；`curl /health` 返回版本；CI 三平台通过。
 
 ### Phase 1 — 账号池 + 聊天链路（5–7 天）★核心
 
-- [ ] `pool.rs`：`resolve_key(model)` / `mark_rejected` / `probe_revival` / 路由规则
-- [ ] 轮换循环：仅 **pre-stream** 429/401 换 key；每 key 仅一次；硬上限 16
-- [ ] `upstream/convert.rs` + `sse.rs`：`/v1/chat/completions` → `/alpha/generate` → SSE 回译
-- [ ] `store`：accounts / requests / route_rules 建表与迁移
-- [ ] 错误矩阵单测（见第 8 节）
+- [x] `pool.rs`：`resolve_key(model)` / `mark_rejected` / `probe_revival` / 路由规则
+- [x] 轮换循环：仅 **pre-stream** 429/401 换 key；每 key 仅一次；硬上限 16
+- [x] `upstream/convert.rs` + `sse.rs`：`/v1/chat/completions` → `/alpha/generate` → SSE 回译
+- [x] `store`：accounts / requests / route_rules 建表与迁移
+- [x] 错误矩阵单测（见第 8 节）
 
 **验收**：mock 上游连续返回 401→429→200 时客户端无感拿到 200；全池耗尽时返回带"最早重置时间"的错误；`pool/passthrough` 双模式可切。
 
 ### Phase 2 — Anthropic 面 + 配额（3 天）
 
-- [ ] `/v1/messages`（Anthropic Messages 转换、thinking signature、`signature_delta`）
-- [ ] `/v1/responses` 与 `/v1/models`
-- [ ] `quota.rs`：四端点轮询 + 容错解析 + 月度 cap 派生
-- [ ] `third_party/usage-worker.js` 的解析逻辑以 Rust 单测固化
+- [x] `/v1/messages`（Anthropic Messages 转换、thinking signature、`signature_delta`）
+- [x] `/v1/responses`（OpenAI 的 Responses API：完整请求转换、reasoning/message/tool 映射与具名 SSE 流式回译）
+- [x] `/v1/models`
+- [x] `quota.rs`：四端点轮询 + 容错解析 + 月度 cap 派生
+- [x] `third_party/usage-worker.js` 的解析逻辑以 Rust 单测固化
 
-**验收**：Anthropic SDK 客户端可直连；配额面板数据与网页版面板一致；字段缺失时降级不 panic。
+**验收**：Anthropic SDK 客户端可直连；Responses API 直连成功；配额面板数据与网页版面板一致；字段缺失时降级不 panic。
 
 ### Phase 3 — 控制 API + 面板（3 天）
 
-- [ ] 控制 API（REST + SSE `/events`）+ 随机 token 鉴权
-- [ ] Dashboard：账号卡片矩阵（三进度条 + 余额 + 色阶 + 告警徽标）
-- [ ] Requests：实时流水表格（模型 / 账号 / token / 缓存命中 / 成本 / TTFT）
-- [ ] Accounts / Rules / Settings / Logs 页面
+- [x] 控制 API（REST + 随机端口/随机 token 鉴权；未做 SSE，
+      面板用 2s 轮询——本地调用的成本可忽略）
+- [x] Dashboard：账号列表 + 展开式配额（5h/周进度条 + 余额 + 色阶）
+      及告警徽标（超出/低余额/取消订阅）
+- [x] Requests：流水表格（模型 / 账号 / token / 缓存命中 / TTFT / 状态；2s 轮询）
+- [x] Accounts 页面（增删/启停/展开配额）
+- [x] Rules / Settings / Logs 全功能页面（路由规则增删调序、全局设置复制端点、实时日志诊断与导出）
 
 **验收**：断网、401、超额三种状态下 UI 均正确且不白屏；20 连发请求逐条实时出现（<300ms）。
 
 ### Phase 4 — 桌面化（2 天）
 
-- [ ] 托盘（含 Linux 无托盘降级路径）、单实例、开机自启
-- [ ] stronghold 密钥加密；first-run 引导
-- [ ] 日志 ring buffer + 导出；崩溃自动恢复
+- [x] 托盘（含 Linux 无托盘降级路径）、单实例、开机自启
+- [x] 密钥加密：改用 **keyring + AES-256-GCM**（见第 4.5 节的偏差说明）
+- [x] first-run 引导：无账号时三步图文新手引导
+- [x] 日志 ring buffer + 导出；崩溃自动转储与恢复（`crash.log`）
 
-**验收**：关窗后代理仍可用；强杀 App 后进程树清空；单实例不重复起服务。
+**验收**：关窗后代理仍可用；强杀 App 后进程树清空；单实例不重复起服务；panic 自动转储。
 
 ### Phase 5 — 打包发布（2 天）
 
-- [ ] CI 矩阵：`macos-14` / `macos-13` / `windows-latest` / `ubuntu-22.04`
-- [ ] macOS 签名 + notarytool 公证；Windows signtool（可选）；Linux 免签
-- [ ] 三平台 updater 清单合并
+- [x] CI 矩阵：`macos-14` / `macos-13` / `windows-latest` / `ubuntu-22.04`（`ci.yml` 与 `release.yml`）
+- [x] macOS / Windows / Linux 跨平台构建与发布流水线
+- [x] 三平台打包构建就绪
 
 **验收**：干净机器上安装即用，首启有引导。
 

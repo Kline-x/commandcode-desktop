@@ -71,8 +71,48 @@ jobs:
         with:
           config: ./typos.toml
 
+      # 通配版本防护。
+      #
+      # cargo-deny 的 wildcards 检查会把 workspace 内的 path 依赖也算作
+      # wildcard（它没有 version 字段），对单 workspace 项目是误报，所以
+      # deny.toml 里那项设为 allow，改用这里显式检查「有没有 "*" 版本」。
+      - name: 禁止通配版本
+        run: |
+          if grep -rnE '^[a-zA-Z0-9_-]+ *= *"[*]"' --include=Cargo.toml .; then
+            echo "::error::发现通配版本依赖（"*"）；请写明确版本或改用 workspace 依赖"
+            exit 1
+          fi
+          echo "未发现通配版本"
+
       - name: cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
           arguments: --all-features
+
+  # 前端单独一个 job：Node 与 Rust 工具链互不依赖，并行跑更快。
+  # 之前 CI 只查 Rust，前端类型错误要等到打包时才发现。
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      # 类型检查：strict 模式下的类型错误必须在合并前拦住
+      - name: typecheck
+        run: pnpm exec tsc --noEmit
+
+      # 生产构建：顺带验证 vite 配置与依赖解析
+      - name: build
+        run: pnpm exec vite build

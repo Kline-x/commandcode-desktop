@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+# cc-server 是平台无关的核心；src-tauri 是桌面外壳
+members = ["crates/*", "src-tauri"]
 
 # 共享的编译产物目录；.gitignore 已忽略 /target
 [workspace.package]
@@ -24,6 +25,8 @@ large_enum_variant = "allow"
 doc_markdown = "allow"
 # 上下游协议里大量 &String 参数沿用既有签名，避免无意义的破坏性改动
 ptr_arg = "allow"
+# 协议转换函数天然参数较多，可读性优先于机械拆包
+too_many_arguments = "allow"
 
 [workspace.lints.rust]
 # unsafe 需要显式理由（本项目预期为 0 处）

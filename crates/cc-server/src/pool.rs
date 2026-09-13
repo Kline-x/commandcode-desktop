@@ -12,6 +12,9 @@
 //! 所有时间都通过参数注入（now_ms），不在函数内部读取系统时间——这样
 //! 过期行为可以被确定性地单测覆盖。
 
+use crate::error::CcError;
+use crate::sse::Usage;
+
 /// 单次请求允许的最大账号轮换次数。
 ///
 /// 与上游一致：即使某个钩子行为异常，也不会在一个请求内无限轮换。
@@ -76,24 +79,30 @@ impl AccountState {
         }
     }
 
-    /// 由一次窗口探测构造标记：窗口未超限则**清除**标记（返回 None）。
+    /// 由一次窗口探测构造标记。
     ///
-    /// 探测失败（probe 为 None）必须原样保留既有状态——失败的探测永远不得
-    /// 改变池状态。返回 None 表示「无新信息」，由调用方保留旧状态。
+    /// 返回值的三态语义必须区分清楚——这是调用方最容易写错的地方：
+    /// - `Some(Some(state))`：窗口仍超限，记录 cooldown；
+    /// - `Some(None)`：窗口已恢复，**明确清除**标记；
+    /// - `None`：探测失败，**无新信息**，调用方必须保留旧状态。
+    ///
+    /// 把「恢复」与「探测失败」压成同一个 None 会让失败的探测把账号错误地复活。
     pub fn after_probe(
         previous: Option<&AccountState>,
-        probe: Option<(bool, i64)>,
-    ) -> Option<Self> {
-        let (exceeded, reset_at) = probe?;
-        if !exceeded {
-            return None;
+        probe: Option<WindowProbe>,
+    ) -> Option<Option<Self>> {
+        let probe = probe?;
+        if !probe.exceeded {
+            return Some(None);
         }
-        Some(Self {
-            kind: AccountStateKind::Cooldown { until_ms: reset_at },
+        Some(Some(Self {
+            kind: AccountStateKind::Cooldown {
+                until_ms: probe.reset_at_ms,
+            },
             reason: previous
                 .map(|p| p.reason.clone())
                 .unwrap_or_else(|| "rate limited (429)".to_string()),
-        })
+        }))
     }
 }
 
@@ -174,6 +183,223 @@ pub fn select_account_for_model<'a>(
     accounts
         .iter()
         .find(|a| a.slot.id == rule.account && account_usable(a.state.as_ref(), now_ms))
+}
+
+/// 一次五小时窗口探测的结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowProbe {
+    /// 该窗口是否已超限。
+    pub exceeded: bool,
+    /// 窗口重置时刻（epoch 毫秒）。
+    pub reset_at_ms: i64,
+}
+
+/// 一次请求的轮换状态机。
+///
+/// 这是**有状态**的部分：它记住哪些 key 已经试过、以及每个 key 为何被拒绝。
+/// 与纯函数分开，是因为「每个 key 只试一次」这条不变式需要一个跨尝试的对象来持有。
+#[derive(Debug)]
+pub struct Rotation {
+    /// 已经尝试过的 key（同一请求内不重复尝试）。
+    tried: Vec<String>,
+    /// 当前使用的 key。
+    current: String,
+}
+
+/// 一次轮换尝试的结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RotationStep {
+    /// 换到下一个账号，继续重试。
+    Switched {
+        /// 新的 key。
+        key: String,
+        /// 新的槽位 id（用于日志与用量归属）。
+        slot_id: String,
+    },
+    /// 没有更多账号可试，结束。
+    Exhausted,
+    /// 该错误与账号无关（换号无用），结束并原样抛出。
+    NotRotatable,
+}
+
+impl Rotation {
+    /// 开始一次请求的轮换：以给定 key 为起点。
+    pub fn start(key: impl Into<String>) -> Self {
+        let key = key.into();
+        Self {
+            tried: vec![key.clone()],
+            current: key,
+        }
+    }
+
+    /// 当前使用的 key。
+    pub fn current_key(&self) -> &str {
+        &self.current
+    }
+
+    /// 已尝试的 key 数量。
+    pub fn attempted(&self) -> usize {
+        self.tried.len()
+    }
+
+    /// 该 key 是否已经尝试过。
+    pub fn has_tried(&self, key: &str) -> bool {
+        self.tried.iter().any(|k| k == key)
+    }
+
+    /// 报告一次失败，决定下一步。
+    ///
+    /// \`error\` 决定「换号有没有用」（见 [CcError::rotates_account]）；
+    /// \`next\` 是候选的下一个账号（由调用方通过池解析得出）。
+    ///
+    /// 返回 [RotationStep::Switched] 时内部状态已推进，调用方应当用新 key 重试。
+    pub fn on_failure(&mut self, error: &CcError, next: Option<ResolvedAccount>) -> RotationStep {
+        if !error.rotates_account() {
+            return RotationStep::NotRotatable;
+        }
+        if self.tried.len() >= MAX_ACCOUNT_ROTATIONS {
+            return RotationStep::Exhausted;
+        }
+        let Some(next) = next else {
+            return RotationStep::Exhausted;
+        };
+        // 同一个 key 不重复尝试（池里两个 slot 可能解析出同一个 key）
+        if self.has_tried(&next.key) {
+            return RotationStep::Exhausted;
+        }
+        self.tried.push(next.key.clone());
+        self.current = next.key.clone();
+        RotationStep::Switched {
+            key: next.key,
+            slot_id: next.slot.id,
+        }
+    }
+}
+
+/// 账号池：持有轮换状态并提供选择。
+///
+/// 状态**按 key 存储**（不是按槽位）：两个槽位共用同一个 key 时共享一份状态，
+/// 凭据变更后新 key 自动获得干净状态。
+#[derive(Debug, Default)]
+pub struct AccountPool {
+    /// key → 状态。
+    states: std::collections::HashMap<String, AccountState>,
+}
+
+impl AccountPool {
+    /// 空池。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录一次拒绝。
+    pub fn mark_rejected(&mut self, key: &str, kind: RejectionKind) {
+        self.states
+            .insert(key.to_string(), AccountState::rejected(kind));
+    }
+
+    /// 记录一次窗口探测结果。
+    ///
+    /// \`probe\` 为 None 表示探测本身失败——**不得**改变状态（失败的探测不携带信息）。
+    pub fn apply_probe(&mut self, key: &str, probe: Option<WindowProbe>) {
+        let previous = self.states.get(key).cloned();
+        match AccountState::after_probe(previous.as_ref(), probe) {
+            Some(Some(next)) => {
+                self.states.insert(key.to_string(), next);
+            }
+            Some(None) => {
+                self.states.remove(key);
+            }
+            None => {}
+        }
+    }
+
+    /// 查询某 key 的状态。
+    pub fn state(&self, key: &str) -> Option<&AccountState> {
+        self.states.get(key)
+    }
+
+    /// 把槽位与 key 配对，并附上当前状态。
+    ///
+    /// \`keys\` 与 \`slots\` 一一对应；key 为 None 的槽位被跳过（未配置凭据）。
+    pub fn resolve(&self, slots: &[AccountSlot], keys: &[Option<String>]) -> Vec<ResolvedAccount> {
+        slots
+            .iter()
+            .zip(keys.iter())
+            .filter_map(|(slot, key)| {
+                let key = key.as_ref()?;
+                Some(ResolvedAccount {
+                    slot: slot.clone(),
+                    key: key.clone(),
+                    state: self.states.get(key).cloned(),
+                })
+            })
+            .collect()
+    }
+
+    /// 选择本次请求要用的账号。
+    ///
+    /// 顺序：模型路由 → 手动指定 → 轮转顺序首个可用。
+    pub fn select<'a>(
+        &self,
+        accounts: &'a [ResolvedAccount],
+        model: &str,
+        rules: &[ModelAccountRule],
+        preferred_id: Option<&str>,
+        now_ms: i64,
+    ) -> Option<&'a ResolvedAccount> {
+        if let Some(routed) = select_account_for_model(accounts, model, rules, now_ms) {
+            return Some(routed);
+        }
+        select_active_account(accounts, preferred_id, now_ms)
+    }
+
+    /// 所有账号都不可用时的错误：带上**最早**的窗口重置时间。
+    ///
+    /// 若全部是 401 禁用，返回 [CcError::InvalidCredential]（这是配置问题，重试无用）。
+    pub fn exhausted_error(&self, accounts: &[ResolvedAccount], now_ms: i64) -> CcError {
+        if accounts.is_empty() {
+            return CcError::MissingCredential;
+        }
+        let all_disabled = accounts.iter().all(|a| {
+            matches!(
+                a.state.as_ref().map(|s| s.kind),
+                Some(AccountStateKind::Disabled)
+            )
+        });
+        if all_disabled {
+            return CcError::InvalidCredential;
+        }
+        let earliest = accounts
+            .iter()
+            .filter_map(|a| match a.state.as_ref().map(|s| s.kind) {
+                Some(AccountStateKind::Cooldown { until_ms }) if until_ms > 0 => Some(until_ms),
+                _ => None,
+            })
+            .min();
+        CcError::all_accounts_exhausted(accounts.len(), earliest, now_ms)
+    }
+}
+
+/// 一次生成的用量合计（跨轮换累加）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageTotals {
+    /// 输入 token 合计。
+    pub input_tokens: u64,
+    /// 输出 token 合计。
+    pub output_tokens: u64,
+    /// 缓存命中合计。
+    pub cached_input_tokens: u64,
+}
+
+impl UsageTotals {
+    /// 累加一次生成的用量。
+    pub fn add(&mut self, usage: Usage) {
+        let usage = usage.normalized();
+        self.input_tokens += usage.input_tokens;
+        self.output_tokens += usage.output_tokens;
+        self.cached_input_tokens += usage.cached_input_tokens;
+    }
 }
 
 #[cfg(test)]
@@ -338,14 +564,31 @@ mod tests {
     #[test]
     fn probe_clears_state_when_window_reopened() {
         let previous = AccountState::rejected(RejectionKind::RateLimit);
-        assert!(AccountState::after_probe(Some(&previous), Some((false, T0))).is_none());
+        // Some(None) = 窗口已恢复，明确要求清除标记（区别于 None = 探测失败）
+        assert_eq!(
+            AccountState::after_probe(
+                Some(&previous),
+                Some(WindowProbe {
+                    exceeded: false,
+                    reset_at_ms: T0
+                })
+            ),
+            Some(None)
+        );
     }
 
     #[test]
     fn probe_records_cooldown_with_reset_time() {
         let previous = AccountState::rejected(RejectionKind::RateLimit);
-        let next =
-            AccountState::after_probe(Some(&previous), Some((true, T0 + 3_600_000))).unwrap();
+        let next = AccountState::after_probe(
+            Some(&previous),
+            Some(WindowProbe {
+                exceeded: true,
+                reset_at_ms: T0 + 3_600_000,
+            }),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(
             next.kind,
             AccountStateKind::Cooldown {
@@ -356,9 +599,219 @@ mod tests {
     }
 
     #[test]
-    fn failed_probe_never_changes_state() {
+    fn failed_probe_yields_no_information() {
         let previous = AccountState::rejected(RejectionKind::RateLimit);
-        // 探测失败（None）表示「无新信息」，调用方据此保留旧状态
-        assert!(AccountState::after_probe(Some(&previous), None).is_none());
+        // None = 探测失败 = 无新信息，调用方据此**保留**旧状态（不是清除）
+        assert_eq!(AccountState::after_probe(Some(&previous), None), None);
+    }
+
+    #[test]
+    fn pool_shares_state_between_slots_with_same_key() {
+        let mut pool = AccountPool::new();
+        pool.mark_rejected("shared", RejectionKind::RateLimit);
+        let slots = vec![slot("a"), slot("b")];
+        let keys = vec![Some("shared".to_string()), Some("shared".to_string())];
+        let resolved = pool.resolve(&slots, &keys);
+        assert_eq!(resolved.len(), 2);
+        assert!(
+            resolved.iter().all(|a| a.state.is_some()),
+            "共用 key 的槽位共享一份状态"
+        );
+    }
+
+    #[test]
+    fn pool_skips_slots_without_keys() {
+        let pool = AccountPool::new();
+        let slots = vec![slot("a"), slot("b")];
+        let keys = vec![Some("k".to_string()), None];
+        let resolved = pool.resolve(&slots, &keys);
+        assert_eq!(resolved.len(), 1, "未配置凭据的槽位应被跳过");
+        assert_eq!(resolved[0].slot.id, "a");
+    }
+
+    #[test]
+    fn pool_apply_probe_removes_state_on_recovery() {
+        let mut pool = AccountPool::new();
+        pool.mark_rejected("k", RejectionKind::RateLimit);
+        assert!(pool.state("k").is_some());
+        pool.apply_probe(
+            "k",
+            Some(WindowProbe {
+                exceeded: false,
+                reset_at_ms: T0,
+            }),
+        );
+        assert!(pool.state("k").is_none(), "窗口恢复后状态应被清除");
+    }
+
+    #[test]
+    fn pool_failed_probe_keeps_state() {
+        let mut pool = AccountPool::new();
+        pool.mark_rejected("k", RejectionKind::RateLimit);
+        pool.apply_probe("k", None);
+        assert!(pool.state("k").is_some(), "探测失败不得改变池状态");
+    }
+
+    #[test]
+    fn all_disabled_reports_invalid_credential_not_rate_limit() {
+        let pool = AccountPool::new();
+        let accounts = vec![
+            account(
+                "a",
+                Some(AccountState::rejected(RejectionKind::InvalidCredential)),
+            ),
+            account(
+                "b",
+                Some(AccountState::rejected(RejectionKind::InvalidCredential)),
+            ),
+        ];
+        assert_eq!(
+            pool.exhausted_error(&accounts, T0),
+            CcError::InvalidCredential
+        );
+    }
+
+    #[test]
+    fn exhausted_error_names_earliest_reset() {
+        let pool = AccountPool::new();
+        let accounts = vec![
+            account(
+                "a",
+                Some(AccountState {
+                    kind: AccountStateKind::Cooldown {
+                        until_ms: T0 + 120_000,
+                    },
+                    reason: "rate limited (429)".into(),
+                }),
+            ),
+            account(
+                "b",
+                Some(AccountState {
+                    kind: AccountStateKind::Cooldown {
+                        until_ms: T0 + 60_000,
+                    },
+                    reason: "rate limited (429)".into(),
+                }),
+            ),
+        ];
+        let err = pool.exhausted_error(&accounts, T0);
+        assert_eq!(err.retry_after_ms(), Some(60_000), "应报告最早的重置时间");
+        assert!(err.to_string().contains("2 个"), "错误信息应说明账号数量");
+    }
+
+    #[test]
+    fn empty_pool_reports_missing_credential() {
+        let pool = AccountPool::new();
+        assert_eq!(pool.exhausted_error(&[], T0), CcError::MissingCredential);
+    }
+
+    #[test]
+    fn rotation_switches_to_next_account_on_rate_limit() {
+        let mut rot = Rotation::start("k1");
+        let step = rot.on_failure(
+            &CcError::UpstreamHttp {
+                status: 429,
+                code: None,
+                body: String::new(),
+            },
+            Some(account("b", None)),
+        );
+        assert_eq!(
+            step,
+            RotationStep::Switched {
+                key: "key-b".to_string(),
+                slot_id: "b".to_string()
+            }
+        );
+        assert_eq!(rot.current_key(), "key-b");
+        assert_eq!(rot.attempted(), 2);
+    }
+
+    #[test]
+    fn rotation_stops_on_errors_that_are_not_account_related() {
+        let mut rot = Rotation::start("k1");
+        // 403 套餐错误：换号无用，必须原样抛出而不是继续轮换
+        let step = rot.on_failure(
+            &CcError::UpstreamHttp {
+                status: 403,
+                code: Some("MODEL_NOT_IN_PLAN".into()),
+                body: String::new(),
+            },
+            Some(account("b", None)),
+        );
+        assert_eq!(step, RotationStep::NotRotatable);
+        assert_eq!(rot.current_key(), "k1", "不可轮换时不应改变当前 key");
+    }
+
+    #[test]
+    fn rotation_never_reuses_a_key() {
+        let mut rot = Rotation::start("k1");
+        // 池解析出同一个 key：必须停下，否则会无限打同一个账号
+        let step = rot.on_failure(
+            &CcError::InvalidCredential,
+            Some(ResolvedAccount {
+                slot: slot("alias"),
+                key: "k1".to_string(),
+                state: None,
+            }),
+        );
+        assert_eq!(step, RotationStep::Exhausted);
+    }
+
+    #[test]
+    fn rotation_is_bounded_by_max_rotations() {
+        // 起点 key 不能与候选 key 重合，否则会触发「不重复尝试」而提前结束
+        let mut rot = Rotation::start("start");
+        for i in 0..MAX_ACCOUNT_ROTATIONS - 1 {
+            let next = ResolvedAccount {
+                slot: slot(&format!("s{i}")),
+                key: format!("k{i}"),
+                state: None,
+            };
+            assert!(matches!(
+                rot.on_failure(&CcError::InvalidCredential, Some(next)),
+                RotationStep::Switched { .. }
+            ));
+        }
+        // 到达上限后必须停止，即使还有候选可用
+        let step = rot.on_failure(
+            &CcError::InvalidCredential,
+            Some(ResolvedAccount {
+                slot: slot("extra"),
+                key: "extra".into(),
+                state: None,
+            }),
+        );
+        assert_eq!(step, RotationStep::Exhausted);
+        assert_eq!(rot.attempted(), MAX_ACCOUNT_ROTATIONS);
+    }
+
+    #[test]
+    fn rotation_exhausts_when_no_candidate_remains() {
+        let mut rot = Rotation::start("k1");
+        assert_eq!(
+            rot.on_failure(&CcError::InvalidCredential, None),
+            RotationStep::Exhausted
+        );
+    }
+
+    #[test]
+    fn usage_totals_normalize_each_addition() {
+        let mut totals = UsageTotals::default();
+        // output=0 的那次应被整体清零（防伪账）
+        totals.add(Usage {
+            input_tokens: 100,
+            output_tokens: 0,
+            cached_input_tokens: 50,
+        });
+        assert_eq!(totals, UsageTotals::default());
+        totals.add(Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_input_tokens: 2,
+        });
+        assert_eq!(totals.input_tokens, 10);
+        assert_eq!(totals.output_tokens, 5);
+        assert_eq!(totals.cached_input_tokens, 2);
     }
 }

@@ -11,9 +11,21 @@ targets = [
 
 [advisories]
 version = 2
-# 有安全公告或 yanked 依赖时失败：依赖问题必须显式处理，不能悄悄放过
+# yanked 一律拒绝：这类依赖随时可能被替换掉。
 yanked = "deny"
-ignore = []
+# workspace 内的 path 依赖（cc-server）不算第三方依赖
+ignore = [
+  # Tauri 的传递依赖链引入的「无人维护」公告。这些 crate 功能稳定、
+  # 无已知漏洞，且**没有可用的替代版本**（rustsec 本身标注 No safe upgrade）。
+  # 逐个登记而不是关掉 unmaintained 检查：将来上游换掉它们时，
+  # 这里的条目会变成多余的，可以清理——比整体放宽安全。
+  "RUSTSEC-2024-0370", # proc-macro-error（tauri-macros 依赖）
+  "RUSTSEC-2025-0081", # unic-char-property（urlpattern 依赖）
+  "RUSTSEC-2025-0080", # unic-char-range
+  "RUSTSEC-2025-0075", # unic-common
+  "RUSTSEC-2025-0098", # unic-ucd-version
+  "RUSTSEC-2025-0100", # unic-ucd-ident
+]
 
 [licenses]
 version = 2
@@ -30,10 +42,21 @@ allow = [
   "MPL-2.0",
   "CC0-1.0",
   "Unlicense",
+  # webpki-roots 的根证书**数据**许可（宽松，允许自由使用与再分发）。
+  # 它随 rustls 引入——我们用 rustls 而非系统 OpenSSL，以保证三平台行为一致。
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.9
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+
+# 通配版本（"*"）一律拒绝。
+#
+# ⚠️ 已知限制：cargo-deny 会把 **workspace 内的 path 依赖**（例如
+# cc-server = { path = "../crates/cc-server" }，没有 version 字段）也算作
+# wildcard，而这对单 workspace 项目是误报——path 依赖本身就是最强的版本锁定。
+# 因此这里不做全局 deny，改为在 CI 中以「是否有 "*" 字面量」的显式检查兜底
+# （见 .github/workflows/ci.yml 的 wildcard 步骤）。
+wildcards = "allow"
 deny = []
