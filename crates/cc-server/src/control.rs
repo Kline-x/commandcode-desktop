@@ -8,10 +8,11 @@
 //! **token 校验**：所有 `/api/*` 路由都要求 `x-control-token`。token 由宿主生成
 //! 并在启动时注入 WebView（`window.__CC_CONTROL__`），不落到磁盘、不写日志。
 
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -21,6 +22,82 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::store::{NewRequest, Store};
+
+/// 内存日志条目。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub id: u64,
+    pub timestamp_ms: i64,
+    pub level: String,
+    pub message: String,
+}
+
+/// 内存循环日志缓冲区（固定容量，默认 500 条）。
+pub struct LogBuffer {
+    counter: std::sync::atomic::AtomicU64,
+    entries: Mutex<VecDeque<LogEntry>>,
+    capacity: usize,
+}
+
+impl LogBuffer {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            counter: std::sync::atomic::AtomicU64::new(1),
+            entries: Mutex::new(VecDeque::with_capacity(capacity)),
+            capacity,
+        }
+    }
+
+    pub fn push(&self, level: impl Into<String>, message: impl Into<String>) {
+        let entry = LogEntry {
+            id: self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            timestamp_ms: crate::time::now_epoch_ms(),
+            level: level.into(),
+            message: message.into(),
+        };
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() >= self.capacity {
+            entries.pop_front();
+        }
+        entries.push_back(entry);
+    }
+
+    pub fn push_raw(&self, text: &str) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let level = if trimmed.contains("ERROR") {
+            "ERROR"
+        } else if trimmed.contains("WARN") {
+            "WARN"
+        } else if trimmed.contains("DEBUG") {
+            "DEBUG"
+        } else {
+            "INFO"
+        };
+        self.push(level, trimmed);
+    }
+
+    pub fn recent(&self, limit: usize) -> Vec<LogEntry> {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let skip = entries.len().saturating_sub(limit);
+        entries.iter().skip(skip).cloned().collect()
+    }
+
+    pub fn clear(&self) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries.clear();
+    }
+}
+
+impl Default for LogBuffer {
+    fn default() -> Self {
+        Self::new(500)
+    }
+}
 
 /// 账号变更回调类型。
 pub type AccountChangeCallback = Arc<dyn Fn() + Send + Sync>;
@@ -35,6 +112,8 @@ pub struct ControlState {
     pub api_base: String,
     /// 账号变更回调（通知代理池与轮询器热重载）。
     pub on_account_changed: Option<AccountChangeCallback>,
+    /// 运行日志循环缓冲区。
+    pub log_buffer: Arc<LogBuffer>,
 }
 
 impl ControlState {
@@ -45,6 +124,7 @@ impl ControlState {
             token: token.into(),
             api_base: "https://api.commandcode.ai".into(),
             on_account_changed: None,
+            log_buffer: Arc::new(LogBuffer::default()),
         }
     }
 
@@ -57,6 +137,12 @@ impl ControlState {
     /// 设置账号变更回调。
     pub fn with_account_callback(mut self, cb: AccountChangeCallback) -> Self {
         self.on_account_changed = Some(cb);
+        self
+    }
+
+    /// 设置日志循环缓冲区。
+    pub fn with_log_buffer(mut self, log_buffer: Arc<LogBuffer>) -> Self {
+        self.log_buffer = log_buffer;
         self
     }
 
@@ -160,7 +246,11 @@ pub fn control_router(state: Arc<ControlState>) -> Router {
         .route("/api/accounts/{id}", axum::routing::delete(delete_account))
         .route("/api/requests/recent", post(recent_requests))
         .route("/api/requests/insert", post(insert_request))
+        .route("/api/rules", get(list_rules).put(update_rules))
+        .route("/api/settings", get(get_all_settings))
         .route("/api/settings/{key}", get(get_setting).put(set_setting))
+        .route("/api/logs", get(get_logs))
+        .route("/api/logs/clear", post(clear_logs))
         // 路由层鉴权
         .route_layer(middleware::from_fn_with_state(state.clone(), require_token))
         // CORS 层在最外层包裹整个服务；预检请求由 CORS 层放行
@@ -429,6 +519,102 @@ async fn set_setting(
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
         Err(e) => control_error(e),
     }
+}
+
+/// 路由规则视图。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteRuleView {
+    pub id: i64,
+    pub models: Vec<String>,
+    pub account_id: String,
+}
+
+async fn list_rules(State(state): State<Arc<ControlState>>) -> Response {
+    match state.store.list_route_rules() {
+        Ok(rows) => {
+            let rules: Vec<RouteRuleView> = rows
+                .into_iter()
+                .map(|r| {
+                    let models =
+                        serde_json::from_str::<Vec<String>>(&r.models_json).unwrap_or_default();
+                    RouteRuleView {
+                        id: r.id,
+                        models,
+                        account_id: r.account_id,
+                    }
+                })
+                .collect();
+            axum::Json(json!({ "rules": rules })).into_response()
+        }
+        Err(e) => control_error(e),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateRulesBody {
+    rules: Vec<UpdateRuleItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateRuleItem {
+    models: Vec<String>,
+    account_id: String,
+}
+
+async fn update_rules(
+    State(state): State<Arc<ControlState>>,
+    axum::Json(body): axum::Json<UpdateRulesBody>,
+) -> Response {
+    let pairs: Vec<(String, String)> = body
+        .rules
+        .into_iter()
+        .map(|item| {
+            let models_json = serde_json::to_string(&item.models).unwrap_or_else(|_| "[]".into());
+            (models_json, item.account_id)
+        })
+        .collect();
+
+    match state.store.replace_route_rules(&pairs) {
+        Ok(()) => {
+            state.notify_account_changed();
+            axum::Json(json!({ "ok": true })).into_response()
+        }
+        Err(e) => control_error(e),
+    }
+}
+
+async fn get_all_settings(State(state): State<Arc<ControlState>>) -> Response {
+    let retention = state
+        .store
+        .get_setting("retention")
+        .ok()
+        .flatten()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(5000);
+    axum::Json(json!({
+        "retention": retention,
+        "api_base": state.api_base,
+    }))
+    .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct GetLogsQuery {
+    limit: Option<usize>,
+}
+
+async fn get_logs(
+    State(state): State<Arc<ControlState>>,
+    Query(query): Query<GetLogsQuery>,
+) -> Response {
+    let limit = query.limit.unwrap_or(200).clamp(1, 1000);
+    let logs = state.log_buffer.recent(limit);
+    axum::Json(json!({ "logs": logs })).into_response()
+}
+
+async fn clear_logs(State(state): State<Arc<ControlState>>) -> Response {
+    state.log_buffer.clear();
+    axum::Json(json!({ "ok": true })).into_response()
 }
 
 /// 行 → 对外形状。密文**不出现**在这个结构里。
@@ -777,5 +963,84 @@ mod tests {
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
         assert!(constant_time_eq(b"", b""));
+    }
+
+    #[tokio::test]
+    async fn rules_list_and_update_over_api() {
+        let st = state();
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("GET").uri("/api/rules"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["rules"].as_array().unwrap().len(), 0);
+
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("PUT").uri("/api/rules"))
+                .body(Body::from(
+                    r#"{"rules":[{"models":["claude-*"],"account_id":"acc-1"}]}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("GET").uri("/api/rules"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let rules = body["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["account_id"], "acc-1");
+        assert_eq!(rules[0]["models"][0], "claude-*");
+    }
+
+    #[tokio::test]
+    async fn logs_buffer_and_api() {
+        let st = state();
+        st.log_buffer.push("INFO", "test message 1");
+        st.log_buffer
+            .push_raw("2026-09-13 [WARN] high latency detected");
+
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("GET").uri("/api/logs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let logs = body["logs"].as_array().unwrap();
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[0]["message"], "test message 1");
+        assert_eq!(logs[1]["level"], "WARN");
+
+        let (status, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("POST").uri("/api/logs/clear"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+
+        let (_, body) = call(
+            st.clone(),
+            with_token(Request::builder().method("GET").uri("/api/logs"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(body["logs"].as_array().unwrap().len(), 0);
     }
 }

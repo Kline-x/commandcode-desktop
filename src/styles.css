@@ -268,3 +268,495 @@ td.num,
 th.num {
   text-align: right;
 }
+
+/* === 顶部导航与工作区切换 === */
+.app__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 16px;
+  margin-bottom: 24px;
+}
+
+.app__branding {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.nav-tabs {
+  display: flex;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.25);
+  padding: 4px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.nav-tab {
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  font-weight: 500;
+}
+
+.nav-tab:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.nav-tab--active {
+  background: var(--panel);
+  color: #fff;
+  border: 1px solid var(--border);
+}
+
+/* === 通用按钮与提示 === */
+.btn {
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  transition: opacity 0.15s;
+}
+
+.btn:hover {
+  opacity: 0.85;
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.btn--secondary {
+  background: #2b313d;
+  color: #e6e8ec;
+}
+
+.btn--danger {
+  background: color-mix(in srgb, var(--err) 20%, transparent);
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.btn--sm {
+  padding: 3px 8px;
+  font-size: 12px;
+}
+
+.btn--icon {
+  padding: 2px 6px;
+  font-size: 12px;
+  margin-right: 4px;
+}
+
+.notice--ok {
+  background: color-mix(in srgb, var(--ok) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--ok) 35%, var(--border));
+  color: var(--ok);
+}
+
+.notice--err {
+  background: color-mix(in srgb, var(--err) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--err) 35%, var(--border));
+  color: var(--err);
+}
+
+/* === 首次使用引导 (Onboarding) === */
+.onboarding-guide {
+  background: rgba(77, 107, 254, 0.05);
+  border: 1px dashed var(--accent);
+  border-radius: 8px;
+  padding: 20px;
+  margin-top: 16px;
+}
+
+.onboarding-guide h3 {
+  margin: 0 0 8px 0;
+  font-size: 15px;
+  color: #fff;
+}
+
+.onboarding-steps {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.onboarding-step {
+  display: flex;
+  gap: 12px;
+  background: var(--panel);
+  padding: 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.step-num {
+  width: 24px;
+  height: 24px;
+  border-radius: 12px;
+  background: var(--accent);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: bold;
+  flex-shrink: 0;
+}
+
+.step-content strong {
+  display: block;
+  font-size: 13px;
+  margin-bottom: 4px;
+}
+
+.step-content p {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+/* === 徽标体系 === */
+.badge--num {
+  font-family: monospace;
+  color: var(--muted);
+}
+
+.badge--model {
+  background: rgba(77, 107, 254, 0.15);
+  border-color: rgba(77, 107, 254, 0.4);
+  color: #8fa1fe;
+  margin-right: 4px;
+}
+
+.badge--alert {
+  margin-left: 8px;
+  font-size: 11px;
+}
+
+.badge--err {
+  background: color-mix(in srgb, var(--err) 20%, transparent);
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.badge--warn {
+  background: color-mix(in srgb, var(--warn) 20%, transparent);
+  border-color: var(--warn);
+  color: var(--warn);
+}
+
+/* === 路由规则面板 === */
+.rules-panel .panel__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.panel__desc {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 4px 0 0;
+}
+
+.rules-form {
+  display: flex;
+  gap: 12px;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 14px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-bottom: 20px;
+}
+
+.form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.form-group label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.form-group input,
+.form-group select {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+}
+
+/* === 全局设置面板 === */
+.settings-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.settings-group {
+  background: rgba(0, 0, 0, 0.2);
+  padding: 18px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.settings-group h3 {
+  margin: 0 0 6px 0;
+  font-size: 15px;
+}
+
+.settings-tip {
+  font-size: 13px;
+  color: var(--muted);
+  margin: 0 0 14px 0;
+}
+
+.endpoint-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.endpoint-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+}
+
+.endpoint-label {
+  font-size: 13px;
+  color: var(--muted);
+  width: 140px;
+}
+
+.endpoint-item code {
+  font-family: monospace;
+  color: #79c0ff;
+  flex: 1;
+}
+
+.setting-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.setting-row:last-child {
+  border-bottom: none;
+}
+
+.setting-info strong {
+  display: block;
+  font-size: 14px;
+}
+
+.setting-info p {
+  margin: 3px 0 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.setting-action {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.setting-action input {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 4px;
+}
+
+/* === 开关组件 (Switch) === */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 24px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #3e4451;
+  transition: 0.2s;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: 0.2s;
+}
+
+input:checked + .slider {
+  background-color: var(--ok);
+}
+
+input:checked + .slider:before {
+  transform: translateX(20px);
+}
+
+.slider.round {
+  border-radius: 24px;
+}
+
+.slider.round:before {
+  border-radius: 50%;
+}
+
+/* === 日志控制台面板 === */
+.logs-panel .panel__header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.logs-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.logs-filter-bar {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  background: rgba(0, 0, 0, 0.2);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+
+.filter-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.filter-group select,
+.filter-group input[type="text"] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.logs-console {
+  background: #0d1117;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  height: 480px;
+  overflow-y: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.logs-console__empty {
+  color: var(--muted);
+  text-align: center;
+  padding: 40px 0;
+}
+
+.log-line {
+  display: flex;
+  gap: 10px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.log-time {
+  color: #8b949e;
+  flex-shrink: 0;
+}
+
+.log-level {
+  font-weight: bold;
+  flex-shrink: 0;
+}
+
+.log-msg {
+  color: #c9d1d9;
+}
+
+.log--err .log-level,
+.log--err .log-msg {
+  color: #ff7b72;
+}
+
+.log--warn .log-level,
+.log--warn .log-msg {
+  color: #d29922;
+}
+
+.log--info .log-level {
+  color: #58a6ff;
+}
+
+.log--debug .log-level {
+  color: #8b949e;
+}
+

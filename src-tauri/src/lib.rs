@@ -1,6 +1,4 @@
-//! Tauri 外壳的库入口。
-//!
-//! 拆成 lib + bin 是 Tauri 2 的惯例：移动端需要库目标，桌面端只需一个 bin。
+use std::sync::{Arc, OnceLock};
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -8,6 +6,46 @@ mod bootstrap;
 mod commands;
 mod secrets;
 mod tray;
+
+static LOG_BUFFER: OnceLock<Arc<cc_server::control::LogBuffer>> = OnceLock::new();
+
+pub fn get_log_buffer() -> Arc<cc_server::control::LogBuffer> {
+    LOG_BUFFER
+        .get_or_init(|| Arc::new(cc_server::control::LogBuffer::new(500)))
+        .clone()
+}
+
+#[derive(Clone)]
+struct TeeWriter {
+    buffer: Arc<cc_server::control::LogBuffer>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TeeWriter {
+    type Writer = TeeLineWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        TeeLineWriter {
+            buffer: Arc::clone(&self.buffer),
+        }
+    }
+}
+
+struct TeeLineWriter {
+    buffer: Arc<cc_server::control::LogBuffer>,
+}
+
+impl std::io::Write for TeeLineWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let _ = std::io::stderr().write(buf);
+        if let Ok(text) = std::str::from_utf8(buf) {
+            self.buffer.push_raw(text);
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stderr().flush()
+    }
+}
 
 /// 应用状态：后台服务的句柄与前端需要的连接信息。
 pub struct AppState {
@@ -25,12 +63,15 @@ pub struct AppState {
 
 /// 启动应用。
 pub fn run() {
-    // 日志：默认 info，可用 RUST_LOG 覆盖。写到 stderr，由宿主决定是否重定向。
+    let log_buffer = get_log_buffer();
+    let tee = TeeWriter { buffer: log_buffer };
+    // 日志：默认 info，可用 RUST_LOG 覆盖。写入 stderr 与内存 ring buffer。
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(tee)
         .init();
 
     // 单实例：第二次启动时把已有窗口带到前台，而不是起第二个代理

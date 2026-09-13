@@ -111,3 +111,32 @@ export function QuotaCard({ quota }: { quota: unknown }): React.JSX.Element | nu
     </div>
   );
 }
+
+export interface AccountAlert {
+  text: string;
+  type: "err" | "warn" | "ok";
+}
+
+export function getAccountAlerts(quota: unknown): AccountAlert[] {
+  if (quota == null || typeof quota !== "object") {
+    return [];
+  }
+  const alerts: AccountAlert[] = [];
+  const snapshot = quota as QuotaSnapshot;
+  if (snapshot.five_hour?.exceeded) {
+    alerts.push({ text: "5h 超限", type: "err" });
+  }
+  if (snapshot.weekly?.exceeded) {
+    alerts.push({ text: "周超限", type: "err" });
+  }
+  if (snapshot.credits) {
+    const total =
+      (snapshot.credits.monthly ?? 0) +
+      (snapshot.credits.purchased ?? 0) +
+      (snapshot.credits.free ?? 0);
+    if (total < 1.0) {
+      alerts.push({ text: "低余额", type: "warn" });
+    }
+  }
+  return alerts;
+}

@@ -45,6 +45,14 @@ pub fn date_string(ms: i64) -> String {
     format!("{y:04}-{mo:02}-{d:02}")
 }
 
+/// 返回当前时刻的 epoch 毫秒数。
+pub fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

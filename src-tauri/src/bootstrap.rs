@@ -65,7 +65,7 @@ impl AccountReloader {
         }
     }
 
-    /// 从数据库重新加载启用的账号和解密密钥，并热更新代理池和配额轮询器。
+    /// 从数据库重新加载启用的账号、路由规则和解密密钥，并热更新代理池和配额轮询器。
     pub fn reload(&self) {
         let slots = load_slots(&self.store);
         let key_lookup = Arc::new(load_key_map(&self.store, &self.secrets));
@@ -73,10 +73,15 @@ impl AccountReloader {
             let map = key_lookup.clone();
             Arc::new(move |slot: &cc_server::AccountSlot| map.get(&slot.id).cloned())
         };
+        let rules = load_rules(&self.store);
         self.proxy_state
             .set_accounts(slots.clone(), Arc::clone(&resolve_key));
+        self.proxy_state.set_rules(rules);
         self.poller.set_accounts(&slots, &resolve_key);
-        tracing::info!(count = slots.len(), "账号池与配额轮询器已完成热重载");
+        tracing::info!(
+            accounts = slots.len(),
+            "账号池、路由规则与配额轮询器已完成热重载"
+        );
 
         // 立即触发一轮探测，无需干等下一个周期
         let poller = Arc::clone(&self.poller);
@@ -84,6 +89,22 @@ impl AccountReloader {
             poller.poll_once().await;
         });
     }
+}
+
+/// 从数据库读路由规则。
+fn load_rules(store: &Store) -> Vec<cc_server::pool::ModelAccountRule> {
+    store
+        .list_route_rules()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| {
+            let models = serde_json::from_str::<Vec<String>>(&row.models_json).unwrap_or_default();
+            cc_server::pool::ModelAccountRule {
+                models,
+                account: row.account_id,
+            }
+        })
+        .collect()
 }
 
 /// 启动后台服务，返回给前端用的连接信息。
@@ -178,9 +199,11 @@ pub fn start(
         upstream_protocol: UpstreamProtocol::Auto,
         ..Config::default()
     };
+    let rules = load_rules(&store);
     let proxy_state = Arc::new(
         ProxyState::new(config.clone(), slots.clone(), Arc::clone(&resolve_key))
             .map_err(|e| StartupError::Core(e.to_string()))?
+            .with_rules(rules)
             // observer 必须先挂上：它负责把每次请求写进 SQLite（面板的流水来源）
             .with_observer(observer),
     );
@@ -203,6 +226,7 @@ pub fn start(
     let control_state = Arc::new(
         ControlState::new(store.clone(), control_token.clone())
             .with_api_base("https://api.commandcode.ai")
+            .with_log_buffer(crate::get_log_buffer())
             .with_account_callback(Arc::new(move || {
                 reloader_for_control.reload();
             })),

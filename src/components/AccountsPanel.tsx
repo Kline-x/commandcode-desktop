@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { addAccount, sendJson } from "../lib/api";
-import { QuotaCard } from "./QuotaBar";
+import { getAccountAlerts, QuotaCard } from "./QuotaBar";
 
 /** 一个账号在控制面上的形状。 */
 interface AccountView {
@@ -100,7 +100,7 @@ export function AccountsPanel(): React.JSX.Element {
 
   return (
     <section className="panel">
-      <h2 className="panel__title">账号</h2>
+      <h2 className="panel__title">账号管理</h2>
 
       <form className="form" onSubmit={(event) => void submit(event)}>
         <input
@@ -128,51 +128,84 @@ export function AccountsPanel(): React.JSX.Element {
       {accounts === null ? (
         <p className="panel__hint">加载中…</p>
       ) : accounts.length === 0 ? (
-        <p className="panel__hint">
-          还没有账号。添加一个 Command Code API key 后，本机任意 OpenAI / Anthropic
-          客户端就能通过下面的端点使用它，额度耗尽时会自动切换到下一个账号。
-        </p>
+        <div className="onboarding-guide">
+          <h3>欢迎使用 Command Code Desktop</h3>
+          <p>当前未配置账号。只需简单配置，即可开启多账号自动轮换与额度实时监控：</p>
+          <div className="onboarding-steps">
+            <div className="onboarding-step">
+              <div className="step-num">1</div>
+              <div className="step-content">
+                <strong>获取 API Key</strong>
+                <p>从 Command Code 控制台复制 <code>user_</code> 开头的 API Key</p>
+              </div>
+            </div>
+            <div className="onboarding-step">
+              <div className="step-num">2</div>
+              <div className="step-content">
+                <strong>添加账号</strong>
+                <p>在上方表单输入别名与密钥，点击“添加”完成本地安全存储</p>
+              </div>
+            </div>
+            <div className="onboarding-step">
+              <div className="step-num">3</div>
+              <div className="step-content">
+                <strong>接入开发工具</strong>
+                <p>将客户端（Cursor、VS Code）的 Base URL 指向 <code>http://127.0.0.1:3050/v1</code></p>
+              </div>
+            </div>
+          </div>
+        </div>
       ) : (
         <table>
           <thead>
             <tr>
               <th>名称</th>
-              <th>密钥</th>
-              <th>状态</th>
+              <th>密钥提示</th>
+              <th>状态与告警</th>
               <th />
             </tr>
           </thead>
           <tbody>
-            {accounts.map((account) => (
-              <tr key={account.id}>
-                <td>
-                  {/* 点名称展开配额：配额数据较宽，塞进表格列会挤坏其他列 */}
-                  <button
-                    type="button"
-                    className="link"
-                    onClick={() => setExpanded(expanded === account.id ? null : account.id)}
-                  >
-                    {expanded === account.id ? "▾" : "▸"} {account.label}
-                  </button>
-                </td>
-                <td>{account.key_hint}</td>
-                <td>
-                  {account.last_error ?? (account.enabled ? "可用" : "已停用")}
-                </td>
-                <td className="num">
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void toggle(account.id, !account.enabled)}
-                  >
-                    {account.enabled ? "停用" : "启用"}
-                  </button>{" "}
-                  <button type="button" disabled={busy} onClick={() => void remove(account.id)}>
-                    删除
-                  </button>
-                </td>
-              </tr>
-            ))}
+            {accounts.map((account) => {
+              const alerts = getAccountAlerts(account.quota);
+              return (
+                <tr key={account.id}>
+                  <td>
+                    {/* 点名称展开配额：配额数据较宽，塞进表格列会挤坏其他列 */}
+                    <button
+                      type="button"
+                      className="link"
+                      onClick={() => setExpanded(expanded === account.id ? null : account.id)}
+                    >
+                      {expanded === account.id ? "▾" : "▸"} {account.label}
+                    </button>
+                  </td>
+                  <td><code>{account.key_hint}</code></td>
+                  <td>
+                    <span className="account-status-text">
+                      {account.last_error ?? (account.enabled ? "正常服务" : "已停用")}
+                    </span>
+                    {alerts.map((alert, aIdx) => (
+                      <span key={aIdx} className={`badge badge--alert badge--${alert.type}`}>
+                        {alert.text}
+                      </span>
+                    ))}
+                  </td>
+                  <td className="num">
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => void toggle(account.id, !account.enabled)}
+                    >
+                      {account.enabled ? "停用" : "启用"}
+                    </button>{" "}
+                    <button type="button" disabled={busy} onClick={() => void remove(account.id)}>
+                      删除
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
             {expanded !== null && (
               <tr>
                 <td colSpan={4}>

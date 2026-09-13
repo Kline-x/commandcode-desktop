@@ -87,3 +87,62 @@ export interface AddAccountResult {
 export function addAccount(label: string, apiKey: string): Promise<AddAccountResult> {
   return invoke<AddAccountResult>("add_account", { label, apiKey });
 }
+
+/** 打开应用本地数据目录。 */
+export function revealDataDir(): Promise<void> {
+  return invoke<void>("reveal_data_dir");
+}
+
+/** 路由规则对象。 */
+export interface RouteRule {
+  id: number;
+  models: string[];
+  account_id: string;
+}
+
+/** 获取全部路由规则。 */
+export async function getRules(): Promise<RouteRule[]> {
+  const data = await getJson<{ rules: RouteRule[] }>("/api/rules");
+  return data.rules;
+}
+
+/** 替换保存全部路由规则。 */
+export async function updateRules(rules: { models: string[]; account_id: string }[]): Promise<void> {
+  await sendJson<{ ok: boolean }>("PUT", "/api/rules", { rules });
+}
+
+/** 全局设置结构。 */
+export interface Settings {
+  retention: number;
+  api_base: string;
+}
+
+/** 获取全局设置。 */
+export function getSettings(): Promise<Settings> {
+  return getJson<Settings>("/api/settings");
+}
+
+/** 修改全局设置项。 */
+export async function setSetting(key: string, value: string): Promise<void> {
+  await sendJson<{ ok: boolean }>("PUT", `/api/settings/${encodeURIComponent(key)}`, { value });
+}
+
+/** 运行日志条目。 */
+export interface LogEntry {
+  id: number;
+  timestamp_ms: number;
+  level: "INFO" | "WARN" | "ERROR" | "DEBUG" | string;
+  message: string;
+}
+
+/** 获取最近运行日志。 */
+export async function getLogs(limit = 200): Promise<LogEntry[]> {
+  const data = await getJson<{ logs: LogEntry[] }>(`/api/logs?limit=${limit}`);
+  return data.logs;
+}
+
+/** 清空运行日志。 */
+export async function clearLogs(): Promise<void> {
+  await sendJson<{ ok: boolean }>("POST", "/api/logs/clear");
+}
+

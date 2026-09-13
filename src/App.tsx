@@ -1,17 +1,20 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { AccountsPanel } from "./components/AccountsPanel";
+import { LogsPanel } from "./components/LogsPanel";
 import { ProxyPanel } from "./components/ProxyPanel";
 import { RequestsPanel } from "./components/RequestsPanel";
+import { RulesPanel } from "./components/RulesPanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { getHealth, type Health } from "./lib/api";
 
+type TabKey = "dashboard" | "requests" | "rules" | "settings" | "logs";
+
 /**
- * 应用骨架。
- *
- * 三个面板对应三件事：代理状态、账号与额度、请求流水。
- * 状态查询失败不阻塞渲染——首次启动时后端可能还没起来，界面要能自己说明这一点。
+ * 应用主容器与工作区导航。
  */
 export function App(): React.JSX.Element {
+  const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -27,7 +30,6 @@ export function App(): React.JSX.Element {
 
   useEffect(() => {
     void refresh();
-    // 后端是本地进程，轮询成本极低；首次启动时它可能晚于窗口就绪
     const timer = window.setInterval(() => void refresh(), 5_000);
     return () => window.clearInterval(timer);
   }, [refresh]);
@@ -35,24 +37,66 @@ export function App(): React.JSX.Element {
   return (
     <div className="app">
       <header className="app__header">
-        <h1>Command Code</h1>
-        <span className={`badge ${health ? "badge--ok" : "badge--down"}`}>
-          {health ? "代理运行中" : "代理未运行"}
-        </span>
+        <div className="app__branding">
+          <h1>Command Code</h1>
+          <span className={`badge ${health ? "badge--ok" : "badge--down"}`}>
+            {health ? "代理运行中 (3050)" : "代理未就绪"}
+          </span>
+        </div>
+
+        <nav className="nav-tabs">
+          <button
+            className={`nav-tab ${activeTab === "dashboard" ? "nav-tab--active" : ""}`}
+            onClick={() => setActiveTab("dashboard")}
+          >
+            📊 仪表盘
+          </button>
+          <button
+            className={`nav-tab ${activeTab === "requests" ? "nav-tab--active" : ""}`}
+            onClick={() => setActiveTab("requests")}
+          >
+            ⚡ 请求流水
+          </button>
+          <button
+            className={`nav-tab ${activeTab === "rules" ? "nav-tab--active" : ""}`}
+            onClick={() => setActiveTab("rules")}
+          >
+            🔀 路由规则
+          </button>
+          <button
+            className={`nav-tab ${activeTab === "settings" ? "nav-tab--active" : ""}`}
+            onClick={() => setActiveTab("settings")}
+          >
+            ⚙️ 全局设置
+          </button>
+          <button
+            className={`nav-tab ${activeTab === "logs" ? "nav-tab--active" : ""}`}
+            onClick={() => setActiveTab("logs")}
+          >
+            📝 运行日志
+          </button>
+        </nav>
       </header>
 
       {error !== null && (
         <p className="notice notice--warn">
           无法连接本地服务：{error}
           <br />
-          请确认应用的后台进程已启动；启动后本页会自动恢复。
+          请确认后台进程已就绪；连接恢复后界面会自动同步。
         </p>
       )}
 
       <main className="app__main">
-        <ProxyPanel health={health} />
-        <AccountsPanel />
-        <RequestsPanel />
+        {activeTab === "dashboard" && (
+          <>
+            <ProxyPanel health={health} />
+            <AccountsPanel />
+          </>
+        )}
+        {activeTab === "requests" && <RequestsPanel />}
+        {activeTab === "rules" && <RulesPanel />}
+        {activeTab === "settings" && <SettingsPanel />}
+        {activeTab === "logs" && <LogsPanel />}
       </main>
     </div>
   );
