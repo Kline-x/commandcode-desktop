@@ -336,8 +336,10 @@ async fn observer_records_each_request() {
     let recs = records.lock().unwrap();
     assert_eq!(recs.len(), 1, "每次请求都应上报一条记录");
     assert_eq!(recs[0].account_id, "default");
+    assert_eq!(recs[0].account_label, "Default");
     assert_eq!(recs[0].model, "deepseek/deepseek-v4-flash");
     assert_eq!(recs[0].protocol, "cli");
+    assert_eq!(recs[0].client_protocol, "openai_chat");
     assert!(recs[0].stream);
     assert_eq!(recs[0].error_code, None);
 }

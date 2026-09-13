@@ -761,6 +761,45 @@ body {
   color: var(--err);
 }
 
+.badge--proto-chat {
+  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(88, 166, 255, 0.28);
+  color: #58a6ff;
+}
+
+.badge--proto-anthropic {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(217, 119, 6, 0.28);
+  color: #f59e0b;
+}
+
+.badge--proto-responses {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.28);
+  color: #10b981;
+}
+
+.badge--channel {
+  background: var(--bg-surface-elevated);
+  border-color: var(--border-subtle);
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.acc-name-cell {
+  font-weight: 500;
+  color: var(--fg);
+  cursor: default;
+}
+
+.cost-cell {
+  font-weight: 600;
+  color: var(--ok);
+}
+
+
 /* ============================================================
    表格与数据流水 (RequestsPanel)
    ============================================================ */

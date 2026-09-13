@@ -190,8 +190,14 @@ pub fn start(
         let row = cc_server::store::NewRequest {
             at_ms: record.at_ms,
             account_id: record.account_id.clone(),
+            account_label: if record.account_label.is_empty() {
+                None
+            } else {
+                Some(record.account_label.clone())
+            },
             model: record.model.clone(),
             protocol: record.protocol.to_string(),
+            client_protocol: record.client_protocol.to_string(),
             stream: record.stream,
             status: record.status,
             error_code: record.error_code.clone(),
@@ -201,6 +207,7 @@ pub fn start(
             ttft_ms: record.ttft_ms,
             total_ms: record.total_ms,
             attempts: record.attempts as i64,
+            cost_usd: record.cost_usd,
         };
         if let Err(error) = store_for_records.insert_request(&row) {
             // 落库失败不能影响已经完成的请求；记日志即可

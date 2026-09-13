@@ -44,3 +44,22 @@
 - 执行 `./scripts/check.sh`：Rust 260 项测试、Clippy（-D warnings）、cargo-deny、TypeScript 类型检查、Vite 构建全部通过。
 - 执行 `pnpm tauri build --bundles app` 生成 Release 应用。
 - 更新并部署到 `/Applications/Command Code.app` 并通过 LaunchServices 注册与启动。
+
+## 2026-09-13 · 优化请求流水（消耗金额、客户端协议与账号名称）
+
+**当前目标**：在请求日志面板补充「消耗金额」、「客户端协议」等关键列，并将账号列从单一 ID 编号升级为展示实际账号名称/备注。
+
+**实施变更**
+- **协议与核心模型**：
+  - `crates/cc-server/src/config.rs`：为 `PublicProtocol` 扩展 `as_str()` 方法。
+  - `crates/cc-server/src/proxy.rs`：新增 `estimate_cost_usd` 模型消耗计费函数；`RequestRecord` 新增 `account_label`、`client_protocol` 与 `cost_usd` 字段，并在各生成阶段注入。
+  - `crates/cc-server/src/store.rs`：升版 schema 至 v2，安全执行 ALTER TABLE 兼容已有数据库迁移；`requests` 表与 `RequestRow`/`NewRequest` 扩展字段，`REQUEST_SELECT` 联合 `accounts` 表自动回退与派生展示名。
+  - `crates/cc-server/src/control.rs`：`RequestView` 结构扩展 `account_label`、`client_protocol` 与 `cost_usd` 并完成序列化映射。
+  - `src-tauri/src/bootstrap.rs`：持久化同步写入新增字段至 SQLite。
+- **前端 UI 与交互**：
+  - `src/components/RequestsPanel.tsx`：新增「客户端协议」（OpenAI Chat / Anthropic / Responses 彩色徽标）与「消耗金额」（精确格式化为美元）列；账号列智能匹配账号备注、密钥提示或编号，悬停展示详情提示。
+  - `src/styles.css`：为不同协议徽标、通道徽标、账号名称和金额单元格增加专用样式与高亮。
+
+**验证与交付**
+- 执行 `./scripts/check.sh`：260 项核心单测、18 项端到端轮转测试、Clippy 零警告、TypeScript 及 Vite 打包全部通过。
+- 执行 `pnpm tauri build --bundles app` 完成生产构建并部署覆盖 `/Applications/Command Code.app` 启动运行。

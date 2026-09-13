@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::CcError;
 
 /// 数据库 schema 版本。每次结构变更都要 +1 并补一条迁移。
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// 一条账号记录。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,10 +54,14 @@ pub struct RequestRow {
     pub at_ms: i64,
     /// 账号 id。
     pub account_id: String,
+    /// 账号展示名（备注）。
+    pub account_label: Option<String>,
     /// 模型。
     pub model: String,
     /// 上游通道（cli / openai）。
     pub protocol: String,
+    /// 客户端协议（openai_chat / anthropic / openai_responses）。
+    pub client_protocol: String,
     /// 是否流式。
     pub stream: bool,
     /// HTTP 状态。
@@ -76,6 +80,8 @@ pub struct RequestRow {
     pub total_ms: i64,
     /// 尝试过的账号次数。
     pub attempts: i64,
+    /// 预估消耗金额（美元）。
+    pub cost_usd: f64,
 }
 
 /// 一条模型→账号路由规则。
@@ -89,6 +95,10 @@ pub struct RouteRuleRow {
     pub account_id: String,
 }
 
+fn default_client_protocol() -> String {
+    "openai_chat".to_string()
+}
+
 /// 落库用的请求记录（id 由数据库分配）。
 ///
 /// 需要 Deserialize：控制面接收代理侧 POST 过来的记录（两者可能不在同一进程）。
@@ -98,10 +108,16 @@ pub struct NewRequest {
     pub at_ms: i64,
     /// 账号 id。
     pub account_id: String,
+    /// 账号展示名（备注）。
+    #[serde(default)]
+    pub account_label: Option<String>,
     /// 模型。
     pub model: String,
     /// 上游通道。
     pub protocol: String,
+    /// 客户端协议。
+    #[serde(default = "default_client_protocol")]
+    pub client_protocol: String,
     /// 是否流式。
     pub stream: bool,
     /// HTTP 状态。
@@ -120,6 +136,9 @@ pub struct NewRequest {
     pub total_ms: i64,
     /// 尝试过的账号次数。
     pub attempts: i64,
+    /// 预估消耗金额。
+    #[serde(default)]
+    pub cost_usd: f64,
 }
 
 /// 存储句柄。
@@ -169,6 +188,16 @@ impl Store {
     fn migrate(&self) -> Result<(), CcError> {
         self.with(|conn| {
             conn.execute_batch(SCHEMA_SQL).map_err(db_err)?;
+            // 兼容老版本库：增量补全新列（已存在时忽略错误）
+            let _ = conn.execute("ALTER TABLE requests ADD COLUMN account_label TEXT", []);
+            let _ = conn.execute(
+                "ALTER TABLE requests ADD COLUMN client_protocol TEXT NOT NULL DEFAULT 'openai_chat'",
+                [],
+            );
+            let _ = conn.execute(
+                "ALTER TABLE requests ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0.0",
+                [],
+            );
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?1)",
                 params![SCHEMA_VERSION.to_string()],
@@ -314,17 +343,29 @@ impl Store {
 impl Store {
     /// 追加一条请求流水，并按保留策略清理旧记录。
     pub fn insert_request(&self, req: &NewRequest) -> Result<i64, CcError> {
+        let mut cost = req.cost_usd;
+        if cost == 0.0 && req.status == 200 && (req.input_tokens > 0 || req.output_tokens > 0) {
+            cost = crate::proxy::estimate_cost_usd(
+                &req.model,
+                req.status,
+                req.input_tokens.max(0) as u64,
+                req.output_tokens.max(0) as u64,
+                req.cached_tokens.max(0) as u64,
+            );
+        }
         let id = self.with(|conn| {
             conn.execute(
                 "INSERT INTO requests (
-                    at_ms, account_id, model, protocol, stream, status, error_code,
-                    input_tokens, output_tokens, cached_tokens, ttft_ms, total_ms, attempts
-                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    at_ms, account_id, account_label, model, protocol, client_protocol, stream, status, error_code,
+                    input_tokens, output_tokens, cached_tokens, ttft_ms, total_ms, attempts, cost_usd
+                 ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     req.at_ms,
                     req.account_id,
+                    req.account_label,
                     req.model,
                     req.protocol,
+                    req.client_protocol,
                     if req.stream { 1 } else { 0 },
                     req.status,
                     req.error_code,
@@ -334,6 +375,7 @@ impl Store {
                     req.ttft_ms,
                     req.total_ms,
                     req.attempts,
+                    cost,
                 ],
             )
             .map_err(db_err)?;
@@ -514,8 +556,10 @@ CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     at_ms INTEGER NOT NULL,
     account_id TEXT NOT NULL,
+    account_label TEXT,
     model TEXT NOT NULL,
     protocol TEXT NOT NULL,
+    client_protocol TEXT NOT NULL DEFAULT 'openai_chat',
     stream INTEGER NOT NULL,
     status INTEGER NOT NULL,
     error_code TEXT,
@@ -524,7 +568,8 @@ CREATE TABLE IF NOT EXISTS requests (
     cached_tokens INTEGER NOT NULL DEFAULT 0,
     ttft_ms INTEGER,
     total_ms INTEGER NOT NULL DEFAULT 0,
-    attempts INTEGER NOT NULL DEFAULT 1
+    attempts INTEGER NOT NULL DEFAULT 1,
+    cost_usd REAL NOT NULL DEFAULT 0.0
 );
 CREATE INDEX IF NOT EXISTS idx_requests_at ON requests(at_ms DESC);
 CREATE TABLE IF NOT EXISTS route_rules (
@@ -543,11 +588,18 @@ const ACCOUNT_SELECT: &str = "SELECT id, label, key_cipher, key_hint, enabled, c
                                     quota_json, last_error, last_checked_ms
                              FROM accounts ORDER BY id ASC";
 
-/// 请求查询语句。
-const REQUEST_SELECT: &str = "SELECT id, at_ms, account_id, model, protocol, stream, status,
-                                     error_code, input_tokens, output_tokens, cached_tokens,
-                                     ttft_ms, total_ms, attempts
-                              FROM requests ORDER BY id DESC LIMIT ?1";
+/// 请求查询语句：LEFT JOIN 账号表以获取最新的展示名/备注。
+const REQUEST_SELECT: &str = "SELECT r.id, r.at_ms, r.account_id,
+                                     COALESCE(NULLIF(r.account_label, ''), NULLIF(a.label, ''), a.key_hint, r.account_id) AS account_label,
+                                     r.model, r.protocol,
+                                     COALESCE(r.client_protocol, 'openai_chat') AS client_protocol,
+                                     r.stream, r.status,
+                                     r.error_code, r.input_tokens, r.output_tokens, r.cached_tokens,
+                                     r.ttft_ms, r.total_ms, r.attempts,
+                                     COALESCE(r.cost_usd, 0.0) AS cost_usd
+                              FROM requests r
+                              LEFT JOIN accounts a ON r.account_id = CAST(a.id AS TEXT)
+                              ORDER BY r.id DESC LIMIT ?1";
 
 /// 行 → AccountRow。
 fn map_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
@@ -566,22 +618,35 @@ fn map_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccountRow> {
 
 /// 行 → RequestRow。
 fn map_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<RequestRow> {
-    Ok(RequestRow {
+    let mut req = RequestRow {
         id: row.get(0)?,
         at_ms: row.get(1)?,
         account_id: row.get(2)?,
-        model: row.get(3)?,
-        protocol: row.get(4)?,
-        stream: row.get::<_, i64>(5)? != 0,
-        status: row.get::<_, i64>(6)? as u16,
-        error_code: row.get(7)?,
-        input_tokens: row.get(8)?,
-        output_tokens: row.get(9)?,
-        cached_tokens: row.get(10)?,
-        ttft_ms: row.get(11)?,
-        total_ms: row.get(12)?,
-        attempts: row.get(13)?,
-    })
+        account_label: row.get(3)?,
+        model: row.get(4)?,
+        protocol: row.get(5)?,
+        client_protocol: row.get(6)?,
+        stream: row.get::<_, i64>(7)? != 0,
+        status: row.get::<_, i64>(8)? as u16,
+        error_code: row.get(9)?,
+        input_tokens: row.get(10)?,
+        output_tokens: row.get(11)?,
+        cached_tokens: row.get(12)?,
+        ttft_ms: row.get(13)?,
+        total_ms: row.get(14)?,
+        attempts: row.get(15)?,
+        cost_usd: row.get(16)?,
+    };
+    if req.cost_usd == 0.0 && req.status == 200 && (req.input_tokens > 0 || req.output_tokens > 0) {
+        req.cost_usd = crate::proxy::estimate_cost_usd(
+            &req.model,
+            req.status,
+            req.input_tokens.max(0) as u64,
+            req.output_tokens.max(0) as u64,
+            req.cached_tokens.max(0) as u64,
+        );
+    }
+    Ok(req)
 }
 
 /// 把 rusqlite 错误统一成 [CcError::Transport]。
@@ -605,8 +670,10 @@ mod tests {
         NewRequest {
             at_ms: 1_700_000_000_000,
             account_id: account.to_string(),
-            model: "m".into(),
+            account_label: Some(format!("账号_{account}")),
+            model: "deepseek/deepseek-v4-flash".into(),
             protocol: "cli".into(),
+            client_protocol: "openai_chat".into(),
             stream: true,
             status,
             error_code: None,
@@ -616,6 +683,7 @@ mod tests {
             ttft_ms: Some(120),
             total_ms: 900,
             attempts: 1,
+            cost_usd: 0.0001,
         }
     }
 
@@ -732,6 +800,9 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, id);
         assert_eq!(rows[0].account_id, "default");
+        assert_eq!(rows[0].account_label.as_deref(), Some("账号_default"));
+        assert_eq!(rows[0].client_protocol, "openai_chat");
+        assert!(rows[0].cost_usd > 0.0);
         assert!(rows[0].stream);
         assert_eq!(rows[0].status, 200);
         assert_eq!(rows[0].input_tokens, 10);

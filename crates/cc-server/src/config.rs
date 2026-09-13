@@ -38,6 +38,17 @@ pub enum PublicProtocol {
     Responses,
 }
 
+impl PublicProtocol {
+    /// 对外协议的稳定标识符（用于流水记录与 UI 展示）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai_chat",
+            Self::Anthropic => "anthropic",
+            Self::Responses => "openai_responses",
+        }
+    }
+}
+
 /// 上游通道选择。
 ///
 /// `/provider/v1/*` 是文档化的接口（需 Pro+ 套餐）；`/alpha/generate` 是逆向所得、
