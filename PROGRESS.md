@@ -91,3 +91,14 @@
 - 执行 `pnpm tauri build --bundles app` 完成桌面端 Release 打包；
 - 部署覆盖至 `/Applications/Command Code.app`，刷新 macOS LaunchServices 图标缓存并重启运行。
 
+---
+
+## [2026-09-13] v0.1.0 正式发版与主分支合并
+
+- **分支合并**：成功将 `feat/phase1-protocol` 全量功能及后续全部优化合并至 `main` 主分支。
+- **版本提升**：版本号统一升版至 `v0.1.0`（`Cargo.toml`、`package.json`、`src-tauri/tauri.conf.json`、`Cargo.lock`）。
+- **全套质量验证**：`./scripts/check.sh` 全检通过（260 项单元测试 + 19 项 E2E 测试 + 11 项 Mock 上游测试全通过，TypeScript 与 Vite 零报错）。
+- **Release 打包**：完成生产环境 Bundle 构建，生成 `Command Code.app` (v0.1.0) 并更新部署到系统 `/Applications/Command Code.app`。
+- **发布 Tag**：创建 `v0.1.0` Git Tag 并推送至 GitHub，触发全平台构建流水线。
+
+

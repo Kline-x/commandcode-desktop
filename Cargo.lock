@@ -554,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "cc-server"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "async-stream",
  "axum",
@@ -659,7 +659,7 @@ dependencies = [
 
 [[package]]
 name = "commandcode-desktop"
-version = "0.0.1"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "axum",
