@@ -128,20 +128,20 @@ export function AccountsPanel(): React.JSX.Element {
   const errCount = accounts?.filter((a) => Boolean(a.last_error)).length ?? 0;
 
   return (
-    <section className="panel" style={{ padding: "20px 24px" }}>
-      <div style={{ marginBottom: 16 }}>
-        <h2 style={{ fontSize: 18, margin: "0 0 4px", color: "#f0f6fc" }}>
-          Command Code 多账号额度面板
-        </h2>
-        <p style={{ fontSize: 13, margin: 0, color: "#8b949e" }}>
-          账号存于本地私有安全存储，随时刷新 5 小时滚动 / 周窗口与信用余额
-        </p>
+    <section className="panel accounts-panel">
+      <div className="panel__header" style={{ marginBottom: 14 }}>
+        <div>
+          <h2 className="panel__title">Command Code 多账号额度面板</h2>
+          <p className="panel__desc">
+            账号存于本地私有安全存储，实时同步 5 小时滚动窗口、每周额度与信用余额
+          </p>
+        </div>
       </div>
 
-      <form className="form" onSubmit={(event) => void submit(event)} style={{ marginBottom: 8 }}>
+      <form className="form" onSubmit={(event) => void submit(event)}>
         <input
           className="form__input"
-          style={{ maxWidth: 200, fontFamily: "inherit" }}
+          style={{ maxWidth: 220 }}
           placeholder="备注名（可留空，自动取名）"
           value={label}
           onChange={(event) => setLabel(event.target.value)}
@@ -155,41 +155,32 @@ export function AccountsPanel(): React.JSX.Element {
           onChange={(event) => setApiKey(event.target.value)}
           disabled={busy}
         />
-        <button type="submit" disabled={busy || apiKey.trim() === ""}>
-          {busy ? "处理中…" : "添加"}
+        <button
+          type="submit"
+          className="btn btn--primary"
+          disabled={busy || apiKey.trim() === ""}
+        >
+          {busy ? "处理中…" : "添加账号"}
         </button>
       </form>
 
-      <p style={{ fontSize: 12, color: "#8b949e", margin: "0 0 16px" }}>
-        添加时自动验证密钥有效性；备注随时可改（点击卡片上的名字）。密钥仅存于本地安全存储。
+      <p className="panel__hint" style={{ margin: "0 0 16px" }}>
+        💡 添加时自动验证密钥有效性；备注随时可改（点击卡片上的名字）。密钥仅存于本地安全存储。
       </p>
 
-      {error !== null && (
-        <div
-          style={{
-            background: "#3d1519",
-            border: "1px solid #da3633",
-            borderRadius: 8,
-            padding: "10px 14px",
-            fontSize: 13,
-            color: "#f85149",
-            marginBottom: 16,
-          }}
-        >
-          {error}
-        </div>
-      )}
+      {error !== null && <div className="notice notice--err">{error}</div>}
 
       {accounts !== null && accounts.length > 0 && (
         <div className="acc-toolbar">
           <span className="count">
             {accounts.length} 个账号 · {activeCount} 个服务中
-            {errCount > 0 && <span style={{ color: "#f85149" }}> · {errCount} 个上次出错</span>}
+            {errCount > 0 && (
+              <span style={{ color: "var(--err)" }}> · {errCount} 个上次出错</span>
+            )}
           </span>
           <button
             type="button"
-            className="mini-btn"
-            style={{ padding: "5px 12px", fontSize: 12 }}
+            className="btn btn--secondary btn--sm"
             disabled={refreshing}
             onClick={() => void handleRefreshAll()}
           >
@@ -199,7 +190,9 @@ export function AccountsPanel(): React.JSX.Element {
       )}
 
       {accounts === null ? (
-        <div style={{ textAlign: "center", color: "#8b949e", padding: "40px 0" }}>加载中…</div>
+        <div style={{ textAlign: "center", color: "var(--muted)", padding: "40px 0" }}>
+          加载中…
+        </div>
       ) : accounts.length === 0 ? (
         <div className="onboarding-guide">
           <h3>欢迎使用 Command Code Desktop</h3>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getSettings, revealDataDir, setSetting } from "../lib/api";
+import { useTheme } from "../lib/theme";
 
 export function SettingsPanel(): React.JSX.Element {
   const [retention, setRetention] = useState("5000");
@@ -10,6 +11,8 @@ export function SettingsPanel(): React.JSX.Element {
   const [saving, setSaving] = useState<boolean>(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  const { mode, effectiveTheme, setMode } = useTheme();
 
   useEffect(() => {
     // 载入设置项
@@ -93,6 +96,50 @@ export function SettingsPanel(): React.JSX.Element {
       {msg && <div className={`notice notice--${msg.type}`}>{msg.text}</div>}
 
       <div className="settings-sections">
+        {/* 外观与主题 */}
+        <div className="settings-group">
+          <h3>外观与主题</h3>
+          <p className="settings-tip">
+            支持跟随系统色彩自动调整，或手动锁定深色 / 浅色模式。当前系统环境：
+            <strong>{effectiveTheme === "dark" ? "深色外观" : "浅色外观"}</strong>。
+          </p>
+
+          <div className="theme-selector-grid">
+            <div
+              className={`theme-card-option ${
+                mode === "system" ? "theme-card-option--active" : ""
+              }`}
+              onClick={() => setMode("system")}
+            >
+              <span className="theme-card-icon">💻</span>
+              <span className="theme-card-title">跟随系统</span>
+              <span className="theme-card-desc">自动跟随 macOS 浅色/深色外观</span>
+            </div>
+
+            <div
+              className={`theme-card-option ${
+                mode === "light" ? "theme-card-option--active" : ""
+              }`}
+              onClick={() => setMode("light")}
+            >
+              <span className="theme-card-icon">☀️</span>
+              <span className="theme-card-title">浅色模式</span>
+              <span className="theme-card-desc">清新高对比度，适合明亮日间</span>
+            </div>
+
+            <div
+              className={`theme-card-option ${
+                mode === "dark" ? "theme-card-option--active" : ""
+              }`}
+              onClick={() => setMode("dark")}
+            >
+              <span className="theme-card-icon">🌙</span>
+              <span className="theme-card-title">深色模式</span>
+              <span className="theme-card-desc">沉浸暗曜黑，适合暗光与开发</span>
+            </div>
+          </div>
+        </div>
+
         {/* 端点配置说明 */}
         <div className="settings-group">
           <h3>代理服务接入端点</h3>

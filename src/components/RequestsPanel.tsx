@@ -56,38 +56,58 @@ export function RequestsPanel(): React.JSX.Element {
       ) : rows.length === 0 ? (
         <p className="panel__hint">还没有请求记录。</p>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>模型</th>
-              <th>账号</th>
-              <th>通道</th>
-              <th className="num">状态</th>
-              <th className="num">输入</th>
-              <th className="num">输出</th>
-              <th className="num">缓存</th>
-              <th className="num">TTFT</th>
-              <th className="num">总耗时</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((row) => (
-              <tr key={row.id}>
-                <td>{formatTime(row.at_ms)}</td>
-                <td>{row.model}</td>
-                <td>{row.account_id}</td>
-                <td>{row.protocol}</td>
-                <td className="num">{row.status}</td>
-                <td className="num">{row.input_tokens}</td>
-                <td className="num">{row.output_tokens}</td>
-                <td className="num">{row.cached_tokens}</td>
-                <td className="num">{row.ttft_ms ?? "—"}</td>
-                <td className="num">{row.total_ms}</td>
+        <div className="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>模型</th>
+                <th>账号</th>
+                <th>通道</th>
+                <th className="num">状态</th>
+                <th className="num">输入</th>
+                <th className="num">输出</th>
+                <th className="num">缓存</th>
+                <th className="num">TTFT</th>
+                <th className="num">总耗时</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr key={row.id}>
+                  <td>{formatTime(row.at_ms)}</td>
+                  <td>
+                    <code>{row.model}</code>
+                  </td>
+                  <td>{row.account_id}</td>
+                  <td>
+                    <span className="badge">{row.protocol}</span>
+                  </td>
+                  <td className="num">
+                    <span
+                      className={`badge ${
+                        row.status >= 200 && row.status < 300
+                          ? "badge--ok"
+                          : row.status >= 400 && row.status < 500
+                          ? "badge--warn"
+                          : "badge--err"
+                      }`}
+                    >
+                      {row.status}
+                    </span>
+                  </td>
+                  <td className="num code-font">{row.input_tokens.toLocaleString()}</td>
+                  <td className="num code-font">{row.output_tokens.toLocaleString()}</td>
+                  <td className="num code-font">{row.cached_tokens.toLocaleString()}</td>
+                  <td className="num code-font">
+                    {row.ttft_ms != null ? `${row.ttft_ms}ms` : "—"}
+                  </td>
+                  <td className="num code-font">{row.total_ms}ms</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </section>
   );

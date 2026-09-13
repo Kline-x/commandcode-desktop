@@ -61,10 +61,10 @@ function formatDuration(seconds: number | null | undefined): string {
 }
 
 function pctColor(usedPct: number): string {
-  if (usedPct >= 90) return "#da3633";
-  if (usedPct >= 75) return "#d29922";
-  if (usedPct >= 50) return "#d29922";
-  return "#3fb950";
+  if (usedPct >= 90) return "var(--err)";
+  if (usedPct >= 75) return "var(--warn)";
+  if (usedPct >= 50) return "var(--warn)";
+  return "var(--ok)";
 }
 
 interface WindowProps {
@@ -273,7 +273,7 @@ export function AccountCard({
           {account.last_error && (
             <div className="stat wide">
               <span>错误诊断</span>
-              <b style={{ color: "#f85149" }}>{account.last_error}</b>
+              <b style={{ color: "var(--err)" }}>{account.last_error}</b>
             </div>
           )}
         </div>

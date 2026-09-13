@@ -2,7 +2,11 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 
 import { App } from "./App";
+import { applyTheme, getInitialThemeMode } from "./lib/theme";
 import "./styles.css";
+
+// 尽早注入主题属性，防止页面加载瞬间闪烁
+applyTheme(getInitialThemeMode());
 
 const root = document.getElementById("root");
 if (root === null) {

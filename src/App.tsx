@@ -7,6 +7,7 @@ import { RequestsPanel } from "./components/RequestsPanel";
 import { RulesPanel } from "./components/RulesPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { getHealth, type Health } from "./lib/api";
+import { useTheme } from "./lib/theme";
 
 type TabKey = "dashboard" | "requests" | "rules" | "settings" | "logs";
 
@@ -17,14 +18,20 @@ export function App(): React.JSX.Element {
   const [activeTab, setActiveTab] = useState<TabKey>("dashboard");
   const [health, setHealth] = useState<Health | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+
+  const { mode, toggleNext } = useTheme();
 
   const refresh = useCallback(async (): Promise<void> => {
     try {
+      setRefreshing(true);
       setHealth(await getHealth());
       setError(null);
     } catch (cause) {
       setHealth(null);
       setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRefreshing(false);
     }
   }, []);
 
@@ -34,14 +41,23 @@ export function App(): React.JSX.Element {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
+  const themeLabel =
+    mode === "system" ? "💻 跟随系统" : mode === "light" ? "☀️ 浅色" : "🌙 深色";
+
   return (
     <div className="app">
       <header className="app__header">
         <div className="app__header-inner">
           <div className="app__branding">
+            <span className="app__brand-icon">⌘</span>
             <h1>Command Code</h1>
-            <span className={`badge ${health ? "badge--ok" : "badge--down"}`}>
-              {health ? "代理运行中 (3050)" : "代理未就绪"}
+            <span
+              className={`status-pill ${
+                health ? "status-pill--ok" : "status-pill--down"
+              }`}
+            >
+              <span className="status-dot" />
+              {health ? "代理就绪 (3050)" : "代理未就绪"}
             </span>
           </div>
 
@@ -77,6 +93,26 @@ export function App(): React.JSX.Element {
               📝 运行日志
             </button>
           </nav>
+
+          <div className="app__header-actions">
+            <button
+              type="button"
+              className="header-action-btn"
+              onClick={toggleNext}
+              title={`当前模式: ${themeLabel} (点击切换)`}
+            >
+              {themeLabel}
+            </button>
+            <button
+              type="button"
+              className="header-action-btn"
+              onClick={() => void refresh()}
+              title="手动刷新状态"
+              disabled={refreshing}
+            >
+              <span className={refreshing ? "spin" : ""}>🔄</span>
+            </button>
+          </div>
         </div>
       </header>
 
