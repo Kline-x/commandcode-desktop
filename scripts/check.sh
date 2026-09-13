@@ -35,4 +35,17 @@ else
   printf '\n(跳过 cargo-deny：未安装。安装：cargo install cargo-deny --locked)\n'
 fi
 
+# 前端：类型检查 + 生产构建。
+# 没有这步的话，前端类型错误要等到 tauri build 才暴露（而那时已经在打包了）。
+if [ -d node_modules ] && command -v pnpm >/dev/null 2>&1; then
+  step "pnpm exec tsc --noEmit"
+  pnpm exec tsc --noEmit
+
+  step "pnpm exec vite build"
+  pnpm exec vite build >/dev/null
+  printf '  构建产物：dist/\n'
+else
+  printf '\n(跳过前端检查：未安装依赖。先运行 pnpm install)\n'
+fi
+
 printf '\n%s全部检查通过%s\n' "$GREEN" "$RESET"

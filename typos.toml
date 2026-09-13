@@ -38,3 +38,14 @@ stronghold = "stronghold"
 reasoning_content = "reasoning_content"
 max_tokens = "max_tokens"
 tool_call_id = "tool_call_id"
+
+# --- 测试夹具里的字符串字面量 ---
+# 这些是刻意构造的假数据，不是拼写错误。把它们当成错误会让 CI 因
+# 「测试里写了 abd / fo」而失败，属于典型的误报。
+# 注意：只豁免**确切的字面量**，不要用通配，避免掩盖真实拼写问题。
+abd = "abd"          # constant_time_eq 的反例（abc vs abd）
+fo = "fo"            # base64 解码表里的样例输入
+ba = "ba"            # base64 样例
+Zm8 = "Zm8"          # "fo" 的 base64 编码
+Zm9v = "Zm9v"        # "foo" 的 base64 编码
+Zm9vYmFy = "Zm9vYmFy" # "foobar" 的 base64 编码
