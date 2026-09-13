@@ -230,45 +230,54 @@ commandcode-desktop/
 
 - [x] 建仓库、MIT LICENSE、.gitignore、README、THIRD_PARTY.md
 - [x] 记录上游 commit hash 到 `third_party/upstream.json`
-- [ ] Tauri 2 模板 + React/Vite 前端跑通空白窗口
-- [ ] `axum` 起 `/health`，端口可配
-- [ ] `scripts/mock-upstream.mjs`：可注入 401 / 402 / 429 / 403 / 正常流
-- [ ] CI 矩阵骨架（三平台 `cargo check`）
+- [x] Tauri 2 模板 + React/Vite 前端跑通空白窗口
+- [x] `axum` 起 `/health`，端口可配
+- [x] mock 上游：改用 Rust 实现（`src/mock_upstream.rs`，真实 axum 服务器，
+      支持 401/402/429/403 upgrade_required/正常流/中途断流/挂起）
+- [x] CI 矩阵骨架（三平台 `cargo check`）
 
 **验收**：`pnpm tauri dev` 出窗口；`curl /health` 返回版本；CI 三平台通过。
 
 ### Phase 1 — 账号池 + 聊天链路（5–7 天）★核心
 
-- [ ] `pool.rs`：`resolve_key(model)` / `mark_rejected` / `probe_revival` / 路由规则
-- [ ] 轮换循环：仅 **pre-stream** 429/401 换 key；每 key 仅一次；硬上限 16
-- [ ] `upstream/convert.rs` + `sse.rs`：`/v1/chat/completions` → `/alpha/generate` → SSE 回译
-- [ ] `store`：accounts / requests / route_rules 建表与迁移
-- [ ] 错误矩阵单测（见第 8 节）
+- [x] `pool.rs`：`resolve_key(model)` / `mark_rejected` / `probe_revival` / 路由规则
+- [x] 轮换循环：仅 **pre-stream** 429/401 换 key；每 key 仅一次；硬上限 16
+- [x] `upstream/convert.rs` + `sse.rs`：`/v1/chat/completions` → `/alpha/generate` → SSE 回译
+- [x] `store`：accounts / requests / route_rules 建表与迁移
+- [x] 错误矩阵单测（见第 8 节）
 
 **验收**：mock 上游连续返回 401→429→200 时客户端无感拿到 200；全池耗尽时返回带"最早重置时间"的错误；`pool/passthrough` 双模式可切。
 
 ### Phase 2 — Anthropic 面 + 配额（3 天）
 
-- [ ] `/v1/messages`（Anthropic Messages 转换、thinking signature、`signature_delta`）
-- [ ] `/v1/responses` 与 `/v1/models`
-- [ ] `quota.rs`：四端点轮询 + 容错解析 + 月度 cap 派生
-- [ ] `third_party/usage-worker.js` 的解析逻辑以 Rust 单测固化
+- [x] `/v1/messages`（Anthropic Messages 转换、thinking signature、`signature_delta`）
+- [ ] `/v1/responses`（OpenAI 的 Responses API；目前未实现——
+      主流客户端用 chat/completions 与 messages 这两个面）
+- [x] `/v1/models`
+- [x] `quota.rs`：四端点轮询 + 容错解析 + 月度 cap 派生
+- [x] `third_party/usage-worker.js` 的解析逻辑以 Rust 单测固化
 
 **验收**：Anthropic SDK 客户端可直连；配额面板数据与网页版面板一致；字段缺失时降级不 panic。
 
 ### Phase 3 — 控制 API + 面板（3 天）
 
-- [ ] 控制 API（REST + SSE `/events`）+ 随机 token 鉴权
-- [ ] Dashboard：账号卡片矩阵（三进度条 + 余额 + 色阶 + 告警徽标）
-- [ ] Requests：实时流水表格（模型 / 账号 / token / 缓存命中 / 成本 / TTFT）
-- [ ] Accounts / Rules / Settings / Logs 页面
+- [x] 控制 API（REST + 随机端口/随机 token 鉴权；未做 SSE，
+      面板用 2s 轮询——本地调用的成本可忽略）
+- [x] Dashboard：账号列表 + 展开式配额（5h/周进度条 + 余额 + 色阶）
+      ⏳ 告警徽标（超出/低余额/取消订阅）尚未在 UI 上呈现，数据已在快照里
+- [x] Requests：流水表格（模型 / 账号 / token / 缓存命中 / TTFT / 状态；
+      2s 轮询）——TTFT 与耗时已展示，「成本」列未做（上游按 credits 计费，
+      逐请求成本需要单价表，暂缺）
+- [x] Accounts 页面（增删/启停/展开配额）
+      ⏳ Rules / Settings / Logs 页面尚未做（路由规则的后端与存储已就绪）
 
 **验收**：断网、401、超额三种状态下 UI 均正确且不白屏；20 连发请求逐条实时出现（<300ms）。
 
 ### Phase 4 — 桌面化（2 天）
 
-- [ ] 托盘（含 Linux 无托盘降级路径）、单实例、开机自启
-- [ ] stronghold 密钥加密；first-run 引导
+- [x] 托盘（含 Linux 无托盘降级路径）、单实例、开机自启
+- [x] 密钥加密：改用 **keyring + AES-256-GCM**（见第 4.5 节的偏差说明）
+      ⏳ first-run 引导尚未做（当前空状态有文字提示）
 - [ ] 日志 ring buffer + 导出；崩溃自动恢复
 
 **验收**：关窗后代理仍可用；强杀 App 后进程树清空；单实例不重复起服务。
