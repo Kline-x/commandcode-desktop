@@ -241,6 +241,7 @@ pub fn control_router(state: Arc<ControlState>) -> Router {
         .route("/api/health", get(health))
         .route("/health", get(health))
         .route("/api/accounts/list", post(list_accounts))
+        .route("/api/accounts/refresh", post(refresh_accounts))
         .route("/api/accounts", post(create_account))
         .route("/api/accounts/{id}", patch(update_account))
         .route("/api/accounts/{id}", axum::routing::delete(delete_account))
@@ -381,6 +382,12 @@ async fn create_account(
         }
         Err(e) => control_error(e),
     }
+}
+
+/// 触发账号配额立即轮询刷新。
+async fn refresh_accounts(State(state): State<Arc<ControlState>>) -> Response {
+    state.notify_account_changed();
+    axum::Json(json!({ "ok": true })).into_response()
 }
 
 /// 修改账号（重命名 / 启停）。

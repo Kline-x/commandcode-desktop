@@ -1,34 +1,21 @@
 import { useCallback, useEffect, useState } from "react";
 
-import { addAccount, sendJson } from "../lib/api";
-import { getAccountAlerts, QuotaCard } from "./QuotaBar";
-
-/** 一个账号在控制面上的形状。 */
-interface AccountView {
-  id: number;
-  label: string;
-  key_hint: string;
-  enabled: boolean;
-  quota: unknown;
-  last_error: string | null;
-  last_checked_ms: number | null;
-}
+import { addAccount, refreshAccounts, sendJson, updateAccount } from "../lib/api";
+import { AccountCard, type AccountView } from "./AccountCard";
 
 /**
- * 账号面板：清单 + 添加表单。
+ * 账号面板：移植自 commandcode-usage 的卡片网格与额度监控系统。
  *
- * 添加走 Tauri IPC（`addAccount`）而不是控制面 HTTP——明文密钥的加密必须
- * 发生在 Rust 侧，见 lib/api.ts 的说明。输入框在提交后立即清空。
+ * 账号以卡片矩阵形式平铺，直观展示 5 小时滚动窗口、每周限额、月度推算额度与信用余额。
  */
 export function AccountsPanel(): React.JSX.Element {
   const [accounts, setAccounts] = useState<AccountView[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
 
   const [label, setLabel] = useState("");
   const [apiKey, setApiKey] = useState("");
-  // 展开查看配额的账号 id（点名称切换）
-  const [expanded, setExpanded] = useState<number | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -51,11 +38,21 @@ export function AccountsPanel(): React.JSX.Element {
       if (busy) {
         return;
       }
+      const trimmedKey = apiKey.trim();
+      const trimmedLabel = label.trim();
+      if (!trimmedKey) {
+        setError("请先填入 API 密钥。");
+        return;
+      }
+      if (!/^[\x21-\x7e]+$/.test(trimmedKey)) {
+        setError("密钥格式不对：检测到中文或全角字符，请重新复制粘贴。");
+        return;
+      }
+
       setBusy(true);
       setError(null);
       try {
-        await addAccount(label, apiKey);
-        // 提交成功后立刻清空密钥输入：明文不该在界面里多停留一秒
+        await addAccount(trimmedLabel, trimmedKey);
         setApiKey("");
         setLabel("");
         await load();
@@ -72,7 +69,22 @@ export function AccountsPanel(): React.JSX.Element {
     async (id: number, enabled: boolean): Promise<void> => {
       setBusy(true);
       try {
-        await sendJson("PATCH", `/api/accounts/${id}`, { enabled });
+        await updateAccount(id, { enabled });
+        await load();
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [load],
+  );
+
+  const rename = useCallback(
+    async (id: number, newLabel: string): Promise<void> => {
+      setBusy(true);
+      try {
+        await updateAccount(id, { label: newLabel });
         await load();
       } catch (cause) {
         setError(cause instanceof Error ? cause.message : String(cause));
@@ -98,45 +110,108 @@ export function AccountsPanel(): React.JSX.Element {
     [load],
   );
 
-  return (
-    <section className="panel">
-      <h2 className="panel__title">账号管理</h2>
+  const handleRefreshAll = useCallback(async (): Promise<void> => {
+    setRefreshing(true);
+    try {
+      await refreshAccounts();
+      // 等待 1 秒使后端探测完成
+      await new Promise((r) => setTimeout(r, 1200));
+      await load();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [load]);
 
-      <form className="form" onSubmit={(event) => void submit(event)}>
+  const activeCount = accounts?.filter((a) => a.enabled).length ?? 0;
+  const errCount = accounts?.filter((a) => Boolean(a.last_error)).length ?? 0;
+
+  return (
+    <section className="panel" style={{ padding: "20px 24px" }}>
+      <div style={{ marginBottom: 16 }}>
+        <h2 style={{ fontSize: 18, margin: "0 0 4px", color: "#f0f6fc" }}>
+          Command Code 多账号额度面板
+        </h2>
+        <p style={{ fontSize: 13, margin: 0, color: "#8b949e" }}>
+          账号存于本地私有安全存储，随时刷新 5 小时滚动 / 周窗口与信用余额
+        </p>
+      </div>
+
+      <form className="form" onSubmit={(event) => void submit(event)} style={{ marginBottom: 8 }}>
         <input
           className="form__input"
-          placeholder="名称（例如 Go #1）"
+          style={{ maxWidth: 200, fontFamily: "inherit" }}
+          placeholder="备注名（可留空，自动取名）"
           value={label}
           onChange={(event) => setLabel(event.target.value)}
           disabled={busy}
         />
         <input
           className="form__input form__input--wide"
-          placeholder="Command Code API key（user_ 开头）"
+          placeholder="API 密钥（从 commandcode.ai/settings 获取）"
           type="password"
           value={apiKey}
           onChange={(event) => setApiKey(event.target.value)}
           disabled={busy}
         />
-        <button type="submit" disabled={busy || label.trim() === "" || apiKey.trim() === ""}>
-          添加
+        <button type="submit" disabled={busy || apiKey.trim() === ""}>
+          {busy ? "处理中…" : "添加"}
         </button>
       </form>
 
-      {error !== null && <p className="panel__hint panel__hint--err">操作失败：{error}</p>}
+      <p style={{ fontSize: 12, color: "#8b949e", margin: "0 0 16px" }}>
+        添加时自动验证密钥有效性；备注随时可改（点击卡片上的名字）。密钥仅存于本地安全存储。
+      </p>
+
+      {error !== null && (
+        <div
+          style={{
+            background: "#3d1519",
+            border: "1px solid #da3633",
+            borderRadius: 8,
+            padding: "10px 14px",
+            fontSize: 13,
+            color: "#f85149",
+            marginBottom: 16,
+          }}
+        >
+          {error}
+        </div>
+      )}
+
+      {accounts !== null && accounts.length > 0 && (
+        <div className="acc-toolbar">
+          <span className="count">
+            {accounts.length} 个账号 · {activeCount} 个服务中
+            {errCount > 0 && <span style={{ color: "#f85149" }}> · {errCount} 个上次出错</span>}
+          </span>
+          <button
+            type="button"
+            className="mini-btn"
+            style={{ padding: "5px 12px", fontSize: 12 }}
+            disabled={refreshing}
+            onClick={() => void handleRefreshAll()}
+          >
+            {refreshing ? "刷新中…" : "全部刷新"}
+          </button>
+        </div>
+      )}
 
       {accounts === null ? (
-        <p className="panel__hint">加载中…</p>
+        <div style={{ textAlign: "center", color: "#8b949e", padding: "40px 0" }}>加载中…</div>
       ) : accounts.length === 0 ? (
         <div className="onboarding-guide">
           <h3>欢迎使用 Command Code Desktop</h3>
-          <p>当前未配置账号。只需简单配置，即可开启多账号自动轮换与额度实时监控：</p>
+          <p>当前未配置账号。在上方填入 API 密钥，即可添加第一个账号并开启多账号自动轮换：</p>
           <div className="onboarding-steps">
             <div className="onboarding-step">
               <div className="step-num">1</div>
               <div className="step-content">
                 <strong>获取 API Key</strong>
-                <p>从 Command Code 控制台复制 <code>user_</code> 开头的 API Key</p>
+                <p>
+                  从 Command Code 控制台复制 <code>user_</code> 开头的 API Key
+                </p>
               </div>
             </div>
             <div className="onboarding-step">
@@ -150,71 +225,26 @@ export function AccountsPanel(): React.JSX.Element {
               <div className="step-num">3</div>
               <div className="step-content">
                 <strong>接入开发工具</strong>
-                <p>将客户端（Cursor、VS Code）的 Base URL 指向 <code>http://127.0.0.1:3050/v1</code></p>
+                <p>
+                  将客户端（Cursor、VS Code）的 Base URL 指向 <code>http://127.0.0.1:3050/v1</code>
+                </p>
               </div>
             </div>
           </div>
         </div>
       ) : (
-        <table>
-          <thead>
-            <tr>
-              <th>名称</th>
-              <th>密钥提示</th>
-              <th>状态与告警</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {accounts.map((account) => {
-              const alerts = getAccountAlerts(account.quota);
-              return (
-                <tr key={account.id}>
-                  <td>
-                    {/* 点名称展开配额：配额数据较宽，塞进表格列会挤坏其他列 */}
-                    <button
-                      type="button"
-                      className="link"
-                      onClick={() => setExpanded(expanded === account.id ? null : account.id)}
-                    >
-                      {expanded === account.id ? "▾" : "▸"} {account.label}
-                    </button>
-                  </td>
-                  <td><code>{account.key_hint}</code></td>
-                  <td>
-                    <span className="account-status-text">
-                      {account.last_error ?? (account.enabled ? "正常服务" : "已停用")}
-                    </span>
-                    {alerts.map((alert, aIdx) => (
-                      <span key={aIdx} className={`badge badge--alert badge--${alert.type}`}>
-                        {alert.text}
-                      </span>
-                    ))}
-                  </td>
-                  <td className="num">
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => void toggle(account.id, !account.enabled)}
-                    >
-                      {account.enabled ? "停用" : "启用"}
-                    </button>{" "}
-                    <button type="button" disabled={busy} onClick={() => void remove(account.id)}>
-                      删除
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-            {expanded !== null && (
-              <tr>
-                <td colSpan={4}>
-                  <QuotaCard quota={accounts.find((a) => a.id === expanded)?.quota} />
-                </td>
-              </tr>
-            )}
-          </tbody>
-        </table>
+        <div className="acc-grid">
+          {accounts.map((account) => (
+            <AccountCard
+              key={account.id}
+              account={account}
+              busy={busy}
+              onToggle={toggle}
+              onRemove={remove}
+              onRename={rename}
+            />
+          ))}
+        </div>
       )}
     </section>
   );

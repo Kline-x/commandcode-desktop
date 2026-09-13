@@ -146,3 +146,16 @@ export async function clearLogs(): Promise<void> {
   await sendJson<{ ok: boolean }>("POST", "/api/logs/clear");
 }
 
+/** 触发全量账号配额即时刷新。 */
+export async function refreshAccounts(): Promise<void> {
+  await sendJson<{ ok: boolean }>("POST", "/api/accounts/refresh");
+}
+
+/** 更新指定账号设置（改名 / 启停）。 */
+export async function updateAccount(
+  id: number,
+  fields: { label?: string; enabled?: boolean },
+): Promise<void> {
+  await sendJson<{ ok: boolean }>("PATCH", `/api/accounts/${id}`, fields);
+}
+
