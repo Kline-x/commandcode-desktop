@@ -3,7 +3,7 @@
 > 跨平台桌面客户端：多账号轮换代理（OpenAI / Anthropic 兼容）+ 实时额度用量面板。
 > 本文是 Phase 0–5 的完整工程计划，作为仓库的单一事实来源（single source of truth）。
 
-- 状态：**Phase 0 进行中**
+- 状态：**Phase 0–5 已完成**（v0.1.0 已发布；各阶段实施状态见第 4.5 节与第 7 节）
 - 技术栈：Tauri 2 + 纯 Rust 后端 + React/Vite 前端
 - 目标平台：macOS (arm64/x64)、Windows (x64, 可选 arm64)、Linux (x64, 可选 arm64)
 - 许可：MIT。协议知识来源于 MIT 上游项目，见 [THIRD_PARTY.md](../THIRD_PARTY.md)
@@ -115,13 +115,13 @@
 | Anthropic 协议面 | `anthropic.rs` | 52 |
 | 配额解析 | `quota.rs` | 33 |
 | 配额轮询器 | `quota_poller.rs` | 16 |
-| 本地代理服务 | `proxy.rs` | 7 |
+| 本地代理服务 | `proxy.rs` | 11 |
 | 控制 API | `control.rs` | 10 |
-| SQLite 存储 | `store.rs` | 15 |
+| SQLite 存储 | `store.rs` | 16 |
 | 时间工具 | `time.rs` | 3 |
 | mock 上游 | `mock_upstream.rs` | 10 |
-| 端到端（错误矩阵 + 双协议） | `tests/e2e_rotation.rs` | 16 |
-| **合计** | | **≈275** |
+| 端到端（错误矩阵 + 双协议 + 回归） | `tests/e2e_rotation.rs` | 23 |
+| **合计** | | **≈299** |
 
 产物：`Command Code.app`（18 MB）+ `.dmg`（5.9 MB），本机 arm64 实测可运行。
 
@@ -153,6 +153,33 @@
 **教训**：`cargo build` 通过、单测全绿，都不等于「能跑」。凡是跨进程边界
 （Tauri 生命周期、自定义协议、CORS、运行时上下文）的缺陷，只能靠真机运行发现。
 因此每个 Phase 的验收都必须包含一次「实际启动并观察」。
+
+### 4.6 事后代码审计发现并修复的缺陷
+
+上表是「启动不起来」类缺陷。另有一类是**能启动、单测全绿，但核心机制实际不工作**——
+它们由一次系统性代码审计 + 针对性复现测试发现，记录在此以免重蹈：
+
+| # | 症状 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 账号一旦 429 就**永久**不可用（只能重启应用），而错误文案却承诺「窗口重置后请求会自动恢复」 | `AccountPool::apply_probe` 是唯一的清除路径，但**全仓库无生产调用方**；`quota_poller` 又刻意不持有账号池 → 标记只进不出 | 新增 `ProxyState::apply_probe_for_slot` + `window_probe_from_snapshot`，在 bootstrap 的配额订阅循环里把快照反馈给池（ARCHITECTURE 第 3.1 节） |
+| 2 | 一次 403「模型不在套餐」的请求**废掉整个账号**，之后所有请求都 429，上游一次都打不到 | `mark_rejected` 在判定 `rotates_account()` **之前**无条件调用——注释写对了「只有账号相关错误才标记」，代码没做到 | 把标记移入 `if error.rotates_account()`；判定与副作用对齐 |
+| 3 | 编码代理（Claude Code / Cursor）的大上下文请求在**本地**就被 413 拒绝，代理看起来完全不工作 | axum `Bytes` 提取器默认上限 **2 MB**（`axum-core` 的 `DEFAULT_LIMIT`），而项目自己的参考实现是 100 MB | 新增 `Config::max_body_bytes`（默认 100 MB，与 proxy.mjs 的 `CC_MAX_BODY_MB` 一致）并在 router 上 `DefaultBodyLimit::max`；mock 上游同步放宽，否则它会掩盖被测代理的行为 |
+| 4 | 设置页的「流水保留条数」能存能显示，但对实际裁剪**零影响** | `bootstrap` 把 retention 硬编码成 5000，`Store.retention` 是只读字段且无 setter | `Store::retention` 改 `AtomicI64` + 新增 `set_retention`（立即裁剪），控制面 `set_setting` 特判 `retention`，启动时从设置表读取 |
+| 5 | 设置页「在访达中打开」点了没有任何反应 | `reveal_data_dir` 只把路径写进日志就 `Ok(())` | 接入 `tauri-plugin-opener` 真正打开，失败如实回报 |
+
+以及两处「代码没做到自己声称的事」：
+
+- **402 不换号**：`rotates_account()` 只认 401/429，漏了 402——而本项目自己的
+  PROTOCOL.md 第 6 节与第 8.1 节都把「402 是账号级额度耗尽、必须换号」列为最大陷阱。
+- **文档宣称的机制不存在**：`README`/`ARCHITECTURE` 写密钥用 stronghold（实际是
+  keyring + AES-256-GCM，主路径还退化成 0600 文件）、文档化 `GET /events` SSE 与
+  `/api/usage/series`（实际是 2s 轮询且无该端点）、`proxy_token` 与可配 `listen_addr`
+  （均未实现）。这些已在文档中改为陈述实际行为。
+
+> 共同教训：**单测覆盖率不等于链路完整性**。这 5 个缺陷里，有 3 个是「模块本身有
+> 完整测试、但没接线」（与上表 #9/#10 同构），另 2 个是「判定逻辑写对了、副作用没跟上」。
+> 因此新增回归测试时，除了「换号成功」这类正向路径，必须覆盖**副作用**与**恢复路径**——
+> 本次为此补了 4 条端到端 + 5 条单测（见第 8.1 节）。
 
 ---
 
@@ -301,12 +328,29 @@ commandcode-desktop/
 |---|---|---|---|
 | 401 | 换号重试 | 全部标记 disabled | 抛 INVALID_CREDENTIAL，提示检查密钥 |
 | 429 | 换号重试 | 探测复活失败 | 抛 RATE_LIMIT，带最早 reset 时间 |
-| 402 | **视为额度耗尽**（换号） | 同 429 | 不得当作"上游整体限流" |
+| 402 | **视为额度耗尽**（换号；`rotates_account()` 必须认 402） | 同 429 | 不得当作"上游整体限流" |
 | 403 `upgrade_required` | 固定降级到 `/alpha/generate` | — | 记住该 key 的协议偏好（TTL 15min） |
 | 403 其他（模型不在套餐） | **不换号**，直接报错 | — | 换号无用，避免误伤整个池 |
 | 200 且流中断 | — | — | 不回放、不换号，原样抛 TRANSPORT |
 
 > ⚠️ 最大陷阱：`proxy.mjs` 的 `mapCcError` 把 **402 也映射成 429**。轮换逻辑必须区分"该账号额度耗尽"（换号有用）与"上游整体限流"（换号无用，应退避）。这是合并两套逻辑时最容易写错的地方。
+>
+> 本节每一条都对应 `tests/e2e_rotation.rs` 里的一个用例，**且必须覆盖副作用**：
+> 只断言「403 不换号」是不够的——第 4.6 节的缺陷 #2 正是在「判定正确」的前提下，
+> 因副作用（`mark_rejected`）没跟上而废掉了账号。因此矩阵的每一格都应同时断言
+> **上游被打了几次** 与 **池的状态变成了什么**。
+
+### 8.1.1 恢复路径与副作用（第 4.6 节的回归测试）
+
+以下是审计后补齐的用例，覆盖此前完全缺失的两类场景：
+
+| 用例 | 断言 |
+|---|---|
+| `rate_limited_account_is_revived_by_a_quota_probe` | 429 标记 → 探测显示窗口重置 → 账号重新服务（而非要求重启） |
+| `plan_error_does_not_poison_the_account_pool` | 403 模型不在套餐之后，同一账号再请求仍能打到上游 |
+| `payment_required_rotates_to_the_next_account` | 402 必须换号（PROTOCOL.md 第 6 节） |
+| `large_context_request_is_not_rejected_locally` | 3 MB 请求体不得被本地 2 MB 默认体限拒绝 |
+| `window_probe_from_snapshot` 的 4 条单测 | 快照→探测的三态换算：无窗口=无信息、未超限=可复活、超限取最早重置、任一窗口超限即不可用 |
 
 ### 8.2 双实现 conformance 测试
 
@@ -321,8 +365,13 @@ commandcode-desktop/
 ### 8.3 其它
 
 - Rust 单测：转换层（消息、工具调用、图片）、SSE 状态机、配额解析
-- 前端：Vitest + Testing Library（关键交互）
-- 端到端：mock 上游 + Playwright（可选）
+- 端到端：mock 上游（真实 axum 服务器 + 行为脚本 + 请求记录）
+- **前端：目前只有 `tsc --noEmit` + `vite build`，没有组件测试**。
+  原计划的 Vitest + Testing Library 未落地；关键交互（新增账号、路由规则增删调序、
+  设置保存）目前靠手测。这是已知缺口，不是「已完成」项。
+- **conformance 测试未实现**：第 8.2 节描述的双实现逐字段 diff 至今没有代码，
+  `third_party/proxy.mjs` 只是作为人工查阅的参照物留在仓库里。
+  依赖它的风险（上游漂移、SSE 状态机偏差）因此仍是敞口。
 
 ---
 
