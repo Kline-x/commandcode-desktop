@@ -28,13 +28,16 @@ English | 简体中文（本文）
 
 ## 状态
 
-**早期开发中** — Phase 0 进行中（仓库骨架、核心 crate、CI 已就绪）。完整路线图见 [docs/PLAN.md](docs/PLAN.md)。
+**Phase 0–5 已完成，v0.1.0 已发布** —— 代理链路、三种对外协议、配额面板、托盘与三平台打包均可用。
+完整路线图与实施状态见 [docs/PLAN.md](docs/PLAN.md)（第 4.5 节记录了与计划的偏差），
+逐阶段进度记录见 [PROGRESS.md](PROGRESS.md)。
 
 ## 技术栈
 
-Tauri 2 + 纯 Rust 后端（axum / reqwest / rusqlite / stronghold）+ React + Vite 前端。
+Tauri 2 + 纯 Rust 后端（axum / reqwest / rusqlite / keyring + AES-256-GCM）+ React + Vite 前端。
 
 选择纯 Rust 而非 Node sidecar 的理由见 [docs/PLAN.md 第 2 节](docs/PLAN.md)。
+密钥的加密方案与「为什么最终没用 stronghold」见 [docs/PLAN.md 第 4.5 节](docs/PLAN.md)。
 
 ## 参与开发
 
@@ -57,7 +60,7 @@ scripts/check.sh             # 跑一遍全部检查
 **一句话规范**：能从工具强制的就不靠人记 —— 格式、lint、拼写、依赖许可全部自动化，
 人工只 review 协议正确性、边界与错误信息。
 
-## 构建（计划中）
+## 构建
 
 ```sh
 pnpm install
@@ -69,12 +72,12 @@ pnpm tauri build    # 打包
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
-| Phase 0 | 骨架、核心 crate、mock 上游、CI 矩阵 | 🚧 进行中 |
-| Phase 1 | 账号池 + 轮换 + 聊天链路 | 🚧 状态机已落地，链路待做 |
-| Phase 2 | Anthropic 面 + 配额轮询 | ⏳ |
-| Phase 3 | 控制 API + 用量面板 | ⏳ |
-| Phase 4 | 托盘、密钥加密、日志 | ⏳ |
-| Phase 5 | 三平台打包发布 | ⏳ |
+| Phase 0 | 骨架、核心 crate、mock 上游、CI 矩阵 | ✅ |
+| Phase 1 | 账号池 + 轮换 + 聊天链路 | ✅ |
+| Phase 2 | Anthropic 面 + Responses API + 配额轮询 | ✅ |
+| Phase 3 | 控制 API + 用量面板 | ✅ |
+| Phase 4 | 托盘、密钥加密、日志 | ✅ |
+| Phase 5 | 三平台打包发布 | ✅ |
 
 ## 致谢与许可
 

@@ -101,4 +101,42 @@
 - **Release 打包**：完成生产环境 Bundle 构建，生成 `Command Code.app` (v0.1.0) 并更新部署到系统 `/Applications/Command Code.app`。
 - **发布 Tag**：创建 `v0.1.0` Git Tag 并推送至 GitHub，触发全平台构建流水线。
 
+## [2026-09-13] 代码审计：修复 5 个「单测全绿但功能实际不工作」的缺陷
+
+**当前目标**：对 v0.1.0 做一次系统性代码审计，找出文档声称可用、测试全绿、
+但实际机制并未生效的问题。
+
+**审计方法**：不依赖阅读结论，对每个可疑点写**可复现的失败测试**再修。
+5 个缺陷全部先用临时用例复现（观察到实际错误状态码），确认后再改代码。
+
+**已修复**
+
+| # | 缺陷 | 根因 | 修复 |
+|---|---|---|---|
+| 1 | 账号一旦 429 就永久不可用，错误文案却承诺「窗口重置后自动恢复」 | `AccountPool::apply_probe` 无任何生产调用方（只有测试），`quota_poller` 又刻意不持有池 → 标记只进不出 | 新增 `ProxyState::apply_probe_for_slot` + `window_probe_from_snapshot`，bootstrap 的配额订阅循环把快照反馈给池 |
+| 2 | 一次 403「模型不在套餐」废掉整个账号 | `mark_rejected` 在判定 `rotates_account()` 之前无条件调用 | 标记移入 `if error.rotates_account()` |
+| 3 | 大上下文请求在本地被 413 拒绝（编码代理不可用） | axum `Bytes` 默认体限 2 MB，参考实现是 100 MB | `Config::max_body_bytes`（100 MB）+ `DefaultBodyLimit::max`；mock 上游同步放宽 |
+| 4 | 设置页「保留条数」是假设置 | retention 被 bootstrap 硬编码，`Store.retention` 只读无 setter | `AtomicI64` + `set_retention`（立即裁剪），控制面特判，启动时从设置表读取 |
+| 5 | 「在访达中打开」点击无反应 | `reveal_data_dir` 只写日志就返回 Ok | 接入 `tauri-plugin-opener`，失败如实回报 |
+
+**顺带修正**：`rotates_account()` 漏了 402（PROTOCOL.md 第 6 节明确要求 402 换号）；
+文档漂移（README/PLAN 的 Phase 状态、ARCHITECTURE 的 stronghold/SSE/模块结构表述）。
+
+**验证**
+- `cargo test -p cc-server`：**265 单元 + 23 E2E + 11 mock = 299 全绿**
+  （新增 4 条端到端回归 + 5 条单测）。
+- `cargo clippy -p cc-server --all-targets -- -D warnings`：零警告。
+- `cargo fmt --all -- --check`、`pnpm exec tsc --noEmit`：通过。
+- `cargo check -p commandcode-desktop`：通过。
+
+**关键教训**：5 个缺陷中 3 个是「模块有完整测试但没接线」，2 个是「判定写对了、
+副作用没跟上」。**单测覆盖率 ≠ 链路完整性**——回归测试必须覆盖副作用与恢复路径，
+而不是只覆盖正向的成功路径。详见 `docs/PLAN.md` 第 4.6 节。
+
+**未修复（已知缺口，已如实记录进 PLAN）**
+- conformance 测试（PLAN 8.2）始终未实现，`third_party/` 目前只是人工参照物。
+- 前端无组件测试，关键交互靠手测。
+- `Config::listen_addr`、`proxy_token`、`/events` SSE、`/api/usage/series` 未实现，
+  文档已改为陈述实际行为而非宣称能力。
+
 
