@@ -55,7 +55,10 @@ pub use pool::{
     AccountState, AccountStateKind, ModelAccountRule, RejectionKind, ResolvedAccount, Rotation,
     RotationStep, UsageTotals, WindowProbe, MAX_ACCOUNT_ROTATIONS, RETRY_MAX_DELAY_MS,
 };
-pub use proxy::{error_response, router, KeyResolver, ProxyState, RequestObserver, RequestRecord};
+pub use proxy::{
+    error_response, router, window_probe_from_snapshot, KeyResolver, ProxyState, RequestObserver,
+    RequestRecord,
+};
 pub use quota::{
     build_snapshot, plan_display_name, plan_monthly_cap, window_reset_wait_ms, AccountIdentity,
     Credits, EndpointResponses, MonthlyQuota, QuotaAlert, QuotaSnapshot, WindowUsage,
