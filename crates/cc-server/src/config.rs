@@ -21,6 +21,21 @@ pub const MODELS_TIMEOUT_MS: u64 = 10_000;
 /// 等待上游响应头的默认超时（**不约束 body 流**）。
 pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 60_000;
 
+/// 本地接受的请求体上限（字节）。
+///
+/// **必须显式设置**：axum 的 `Bytes` 提取器自带 2 MB 默认限制
+/// （`axum-core` 的 `DEFAULT_LIMIT = 2_097_152`）。编码代理（Claude Code / Cursor /
+/// Codex）会把整个仓库上下文塞进一次请求，几 MB 是常态——2 MB 会让这些请求在
+/// **本地**就被 413 拒绝，根本到不了上游轮换层，表现为「代理完全不工作」。
+///
+/// 默认值与参考实现 `third_party/proxy.mjs` 的 `CC_MAX_BODY_MB` 保持一致（100 MB），
+/// 这样 conformance 对照的两侧接受的请求面是同一个。
+///
+/// ⚠️ 内存注意：上游请求体在内存中会有约 5.1–7.4× 的放大
+/// （见 docs/PROTOCOL.md #11），因此 100 MB 的入站在最坏情况下对应数百 MB 驻留。
+/// 单机自用（本项目的定位）可以接受；若要下调，改这个常量即可。
+pub const DEFAULT_MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
+
 /// 流空闲超时：超过该时长没有任何事件即判定为死连接。
 ///
 /// 默认给到 5 分钟是**有意**的：xhigh/max 档的推理模型可以静默思考很久，
@@ -86,6 +101,8 @@ pub struct Config {
     pub request_timeout: Duration,
     /// 流空闲超时。
     pub stream_idle_timeout: Duration,
+    /// 本地接受的请求体上限（字节），见 [DEFAULT_MAX_BODY_BYTES]。
+    pub max_body_bytes: usize,
     /// 上游通道偏好。
     pub upstream_protocol: UpstreamProtocol,
     /// 无 system prompt 时是否发送空格占位。
@@ -108,6 +125,7 @@ impl Default for Config {
             listen_addr: "127.0.0.1:3050".to_string(),
             request_timeout: Duration::from_millis(DEFAULT_REQUEST_TIMEOUT_MS),
             stream_idle_timeout: Duration::from_millis(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             upstream_protocol: UpstreamProtocol::Auto,
             empty_system_placeholder: true,
             zdr: false,
@@ -132,5 +150,11 @@ mod tests {
             "空格占位默认开启（省 7.5K token）"
         );
         assert!(!c.zdr, "ZDR 需显式开启");
+        // 2 MB 的 axum 默认值会让编码代理的大上下文请求在本地就被 413 拒绝
+        assert_eq!(
+            c.max_body_bytes,
+            100 * 1024 * 1024,
+            "请求体上限必须与参考实现（proxy.mjs 的 CC_MAX_BODY_MB=100）一致"
+        );
     }
 }

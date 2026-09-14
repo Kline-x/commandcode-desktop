@@ -528,6 +528,27 @@ async fn set_setting(
     Path(key): Path<String>,
     axum::Json(body): axum::Json<SetSettingBody>,
 ) -> Response {
+    // retention 不是普通设置：它同时决定 Store 的裁剪行为。
+    // 只写进 settings 表会让 UI 显示已保存而实际不生效（此前正是如此）。
+    if key == "retention" {
+        match body.value.trim().parse::<i64>() {
+            Ok(keep) if keep > 0 => match state.store.set_retention(keep) {
+                Ok(trimmed) => {
+                    tracing::info!(keep, trimmed, "流水保留条数已更新并立即裁剪");
+                }
+                Err(e) => return control_error(e),
+            },
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(ControlError {
+                        error: "retention 必须是正整数".into(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    }
     match state.store.set_setting(&key, &body.value) {
         Ok(()) => axum::Json(json!({ "ok": true })).into_response(),
         Err(e) => control_error(e),
@@ -597,13 +618,9 @@ async fn update_rules(
 }
 
 async fn get_all_settings(State(state): State<Arc<ControlState>>) -> Response {
-    let retention = state
-        .store
-        .get_setting("retention")
-        .ok()
-        .flatten()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(5000);
+    // 以 Store 的**实时**值为准（它才是真正决定裁剪的那个），
+    // settings 表只是持久化载体；两者不一致时显示前者，避免 UI 撒谎。
+    let retention = state.store.retention().max(1);
     axum::Json(json!({
         "retention": retention,
         "api_base": state.api_base,

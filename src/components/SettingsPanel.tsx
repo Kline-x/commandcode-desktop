@@ -68,9 +68,15 @@ export function SettingsPanel(): React.JSX.Element {
 
   const handleOpenDataDir = async () => {
     try {
+      setMsg(null);
       await revealDataDir();
     } catch (e) {
-      setMsg({ type: "err", text: `打开目录失败: ${String(e)}` });
+      // 原生侧打不开（无文件管理器 / 权限不足）时如实告知；
+      // 此前该命令只写日志就返回成功，用户点了没有任何反馈。
+      setMsg({
+        type: "err",
+        text: `打开目录失败：${e instanceof Error ? e.message : String(e)}`,
+      });
     }
   };
 

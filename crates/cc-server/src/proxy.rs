@@ -31,7 +31,7 @@ use crate::error::{CcError, ErrorEnvelope};
 use crate::openai::{build_completion, to_sse_line, ChunkBuilder, SSE_DONE};
 use crate::pool::{
     AccountPool, AccountSlot, ModelAccountRule, RejectionKind, ResolvedAccount, Rotation,
-    RotationStep, UsageTotals,
+    RotationStep, UsageTotals, WindowProbe,
 };
 use crate::upstream::{now_ms, EventStream, UpstreamClient};
 
@@ -42,6 +42,43 @@ pub type KeyResolver = Arc<dyn Fn(&AccountSlot) -> Option<String> + Send + Sync>
 
 /// 请求完成后的回调（用于落库与推送到 UI）。
 pub type RequestObserver = Arc<dyn Fn(RequestRecord) + Send + Sync>;
+
+/// 把一次配额快照换算成账号池能消费的窗口探测结果。
+///
+/// 返回值的三态**必须**区分清楚，否则一次失败的探测会把账号错误地复活：
+/// - `Some(probe)` — 拿到了窗口数据，可以据此改状态；
+/// - `None` — 两个窗口都不在快照里（credits 端点失败或字段漂移），
+///   **没有信息**，调用方必须保留旧状态。
+///
+/// 超限时取两个窗口里**最早**的重置时刻：`exhausted_error` 要用它告诉客户端
+/// 「什么时候可以重试」，取晚了会让客户端睡过头。
+pub fn window_probe_from_snapshot(snapshot: &crate::quota::QuotaSnapshot) -> Option<WindowProbe> {
+    let windows = [snapshot.five_hour.as_ref(), snapshot.weekly.as_ref()];
+    let present: Vec<&crate::quota::WindowUsage> = windows.into_iter().flatten().collect();
+    if present.is_empty() {
+        // 没有窗口数据：探测失败不携带信息（docs/PROTOCOL.md 第 7 节）
+        return None;
+    }
+    let exceeded: Vec<&&crate::quota::WindowUsage> =
+        present.iter().filter(|w| w.exceeded).collect();
+    if exceeded.is_empty() {
+        // 有窗口数据且都未超限 → 明确「这个账号现在可用」，清除标记
+        return Some(WindowProbe {
+            exceeded: false,
+            reset_at_ms: 0,
+        });
+    }
+    let earliest_reset = exceeded
+        .iter()
+        .map(|w| w.reset_at_ms)
+        .filter(|reset| *reset > 0)
+        .min()
+        .unwrap_or(0);
+    Some(WindowProbe {
+        exceeded: true,
+        reset_at_ms: earliest_reset,
+    })
+}
 
 /// 计算本次请求预估的消耗金额（美元）。
 ///
@@ -237,10 +274,56 @@ impl ProxyState {
         let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         pool.mark_rejected(key, kind);
     }
+
+    /// 用一次配额探测的结果更新账号池的可用性。
+    ///
+    /// **这是「429 标记的账号能自己活过来」的唯一路径。** 在此之前
+    /// [`AccountPool::apply_probe`] 只有测试调用过：账号一旦被 429 标记成
+    /// `Unknown`（不可用），就再没有任何生产代码能把标记清掉——只能重启进程。
+    /// 而错误文案偏偏承诺「窗口重置后请求会自动恢复」，与实际行为相反。
+    ///
+    /// 语义（由 [`AccountState::after_probe`] 保证）：
+    /// - 探测成功且窗口**未**超限 → 清除标记（账号复活）；
+    /// - 探测成功且窗口**仍**超限 → 记录 cooldown（带准确的重置时刻，
+    ///   比 429 当时的 `Unknown` 更有信息量，`exhausted_error` 能给出最早重置时间）；
+    /// - 探测失败（`probe` 为 None）→ **不改变状态**，失败不携带信息
+    ///   （docs/PROTOCOL.md 第 7 节：探针失败不得改变账号池状态）。
+    ///
+    /// 探测结果按**槽位 id** 传入，内部换算成 key：池的状态以 key 为键，
+    /// 而配额轮询器只知道槽位 id（它不该碰 key，见 quota_poller 的模块注释）。
+    pub fn apply_probe_for_slot(&self, slot_id: &str, probe: Option<WindowProbe>) {
+        let slots = self.slots.read().unwrap_or_else(|e| e.into_inner());
+        let resolve = self.resolve_key.read().unwrap_or_else(|e| e.into_inner());
+        let slot = slots.iter().find(|slot| slot.id == slot_id);
+        // 与 [Self::resolved] 同一处理：clippy 建议写 `&**resolve`，但双重解引用会
+        // 掩盖「这是一次 keychain 查询」的语义；显式闭包更清楚。
+        #[allow(clippy::redundant_closure)]
+        let key = slot.and_then(|found| resolve(found));
+        let Some(key) = key else {
+            // 账号已被删除或凭据不可解析：没有可标记的对象
+            return;
+        };
+        drop(slots);
+        drop(resolve);
+
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
+        // 健康账号 + 探测失败：没有新信息，不必写池（也避免覆盖刚标记的状态）
+        if pool.state(&key).is_none() && probe.is_none() {
+            return;
+        }
+        let revived = probe.as_ref().is_some_and(|p| !p.exceeded) && pool.state(&key).is_some();
+        pool.apply_probe(&key, probe);
+        if revived {
+            tracing::info!(slot_id, "账号窗口已重置，重新纳入轮换");
+        }
+    }
 }
 
 /// 构造路由。
 pub fn router(state: Arc<ProxyState>) -> Router {
+    // 请求体上限必须显式放宽：axum 的 Bytes 提取器默认只收 2 MB，
+    // 而编码代理的大上下文请求远超这个量级（见 Config::max_body_bytes）。
+    let body_limit = axum::extract::DefaultBodyLimit::max(state.config.max_body_bytes);
     Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
@@ -253,6 +336,7 @@ pub fn router(state: Arc<ProxyState>) -> Router {
         .route("/v1/responses", post(responses))
         .route("/responses", post(responses))
         .route("/v1/v1/responses", post(responses))
+        .layer(body_limit)
         .with_state(state)
 }
 
@@ -518,15 +602,23 @@ async fn run_generation(
                 continue;
             }
 
-            // 只有「账号相关」的错误才换号；403 套餐错误换号无用且会误伤整个池
-            state.mark_rejected(
-                &current.key,
-                if error.http_status() == 401 {
-                    RejectionKind::InvalidCredential
-                } else {
-                    RejectionKind::RateLimit
-                },
-            );
+            // 只有「账号相关」的错误才标记并换号。
+            //
+            // ⚠️ 标记必须在**判定之后**：`mark_rejected` 会让该 key 变成不可用，
+            // 而 403「模型不在套餐」这类**请求侧**错误换号无用。此前无条件标记会把
+            // 一次模型不支持的请求变成「这个账号以后都不能用了」——配合
+            // docs/PLAN.md 第 8.1 节「换号无用反而误伤整个池」的警告，这是同一类
+            // 缺陷的副作用版本（判定写对了，副作用没跟上）。
+            if error.rotates_account() {
+                state.mark_rejected(
+                    &current.key,
+                    if error.http_status() == 401 {
+                        RejectionKind::InvalidCredential
+                    } else {
+                        RejectionKind::RateLimit
+                    },
+                );
+            }
             let next = next_account(&state, &rotation);
             match rotation.on_failure(&error, next) {
                 RotationStep::Switched { key, .. } => {
@@ -1179,5 +1271,61 @@ mod tests {
             401,
             "/responses 路由应到达并返回 401 而非 404"
         );
+    }
+
+    // ---- 配额快照 → 账号池探测的换算 ----
+
+    fn window(used: f64, cap: f64, exceeded: bool, reset_at_ms: i64) -> crate::quota::WindowUsage {
+        crate::quota::WindowUsage {
+            used,
+            cap,
+            exceeded,
+            reset_at_ms,
+        }
+    }
+
+    #[test]
+    fn snapshot_without_windows_yields_no_probe() {
+        // credits 端点失败或字段漂移：没有信息，必须返回 None 让调用方保留旧状态。
+        // 若这里错误地返回「未超限」，一次失败的探测就会把账号误判为可用。
+        let snapshot = crate::quota::QuotaSnapshot::default();
+        assert!(window_probe_from_snapshot(&snapshot).is_none());
+    }
+
+    #[test]
+    fn healthy_window_reports_not_exceeded() {
+        let snapshot = crate::quota::QuotaSnapshot {
+            five_hour: Some(window(1.0, 100.0, false, 0)),
+            ..Default::default()
+        };
+        let probe = window_probe_from_snapshot(&snapshot).expect("有窗口数据就应有探测结果");
+        assert!(!probe.exceeded, "未超限应能清除账号的 429 标记");
+    }
+
+    #[test]
+    fn exceeded_window_picks_the_earliest_reset() {
+        // 两个窗口都超限时取最早的：取晚了会让客户端睡过头，
+        // 而 exhausted_error 要把它作为 Retry-After 回报。
+        let snapshot = crate::quota::QuotaSnapshot {
+            five_hour: Some(window(100.0, 100.0, true, 5_000)),
+            weekly: Some(window(200.0, 200.0, true, 3_000)),
+            ..Default::default()
+        };
+        let probe = window_probe_from_snapshot(&snapshot).expect("应产出探测结果");
+        assert!(probe.exceeded);
+        assert_eq!(probe.reset_at_ms, 3_000, "应取最早的重置时刻");
+    }
+
+    #[test]
+    fn one_exceeded_window_is_enough_to_keep_the_account_out() {
+        // 只有周窗口超限、5 小时窗口健康：账号仍不可用（任一窗口耗尽即不可服务）
+        let snapshot = crate::quota::QuotaSnapshot {
+            five_hour: Some(window(1.0, 100.0, false, 0)),
+            weekly: Some(window(200.0, 200.0, true, 7_000)),
+            ..Default::default()
+        };
+        let probe = window_probe_from_snapshot(&snapshot).expect("应产出探测结果");
+        assert!(probe.exceeded, "任一窗口超限即不可用");
+        assert_eq!(probe.reset_at_ms, 7_000);
     }
 }

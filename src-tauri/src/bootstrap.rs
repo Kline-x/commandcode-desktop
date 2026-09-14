@@ -91,6 +91,23 @@ impl AccountReloader {
     }
 }
 
+/// 从数据库读设置页持久化的流水保留条数。
+///
+/// 数据库可能不存在（首次启动）或还没有这一项，两种情况下都返回 None，
+/// 由调用方回落到默认值——不在这里建库，避免与 [Store::open] 抢同一个文件。
+fn read_retention(db_path: &std::path::Path) -> Option<i64> {
+    if !db_path.exists() {
+        return None;
+    }
+    let store = Store::open(db_path, 0).ok()?;
+    store
+        .get_setting("retention")
+        .ok()
+        .flatten()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|keep| *keep > 0)
+}
+
 /// 从数据库读路由规则。
 fn load_rules(store: &Store) -> Vec<cc_server::pool::ModelAccountRule> {
     store
@@ -138,9 +155,12 @@ pub fn start(
     }
 
     let db_path = data_dir.join("commandcode.db");
-    // 保留最近 5000 条流水：足够面板回溯，又不会让数据库无限增长
-    let store =
-        Arc::new(Store::open(&db_path, 5_000).map_err(|e| StartupError::Database(e.to_string()))?);
+    // 保留条数：优先取设置页持久化的值，缺失时用 5000。
+    // 此前这里硬编码 5000，导致设置页改的值重启后失效（且当次运行也无效）。
+    let retention = read_retention(&db_path).unwrap_or(5_000);
+    let store = Arc::new(
+        Store::open(&db_path, retention).map_err(|e| StartupError::Database(e.to_string()))?,
+    );
 
     // 控制面用随机端口 + 随机 token（见模块文档）
     let control_token = random_token();
@@ -254,7 +274,8 @@ pub fn start(
             })),
     );
     let control_app = control_router(control_state);
-    let proxy_app = proxy_router(proxy_state);
+    // proxy_state 被路由与配额回写两处共享，因此先 clone 给 router
+    let proxy_app = proxy_router(proxy_state.clone());
 
     let control_url = format!("http://{control_addr}");
     let proxy_url = format!("http://{proxy_addr}");
@@ -287,13 +308,22 @@ pub fn start(
         tracing::debug!("配额轮询已停止");
     });
 
-    // 配额更新回写：将轮询快照同步写入 SQLite accounts 表
+    // 配额更新回写：将轮询快照同步写入 SQLite accounts 表，
+    // 并把探测结果反馈给账号池（429 标记的账号靠这一步复活）。
     let mut quota_rx = poller.subscribe();
     let store_for_quota = store.clone();
+    let proxy_state_for_quota = proxy_state.clone();
     tauri::async_runtime::spawn(async move {
         loop {
             match quota_rx.recv().await {
                 Ok(update) => {
+                    // 反馈给账号池：窗口已重置 → 清除 429 标记，重新纳入轮换。
+                    // 没有这一步，被标记的账号在本进程内永远不会恢复
+                    //（错误文案承诺的「窗口重置后自动恢复」会落空）。
+                    proxy_state_for_quota.apply_probe_for_slot(
+                        &update.account_id,
+                        cc_server::window_probe_from_snapshot(&update.snapshot),
+                    );
                     if let Ok(id) = update.account_id.parse::<i64>() {
                         let quota_json = serde_json::to_string(&update.snapshot).ok();
                         let last_error = update.snapshot.last_error.as_deref();
@@ -406,8 +436,8 @@ fn load_slots(store: &Store) -> Vec<cc_server::AccountSlot> {
 
 /// 构造槽位 id → API key 的映射。
 ///
-/// 这里调用 secrets 解密；当前实现把「密文即明文」的占位逻辑留在 secrets.rs，
-/// 接入 stronghold 后本函数无需改动。
+/// 这里调用 secrets 解密；主密钥的加载与来源见 `secrets.rs` 的模块文档
+/// （优先本地 0600 文件，并兼容迁移旧版系统钥匙串里的密文）。
 fn load_key_map(
     store: &Store,
     secrets: &crate::secrets::Secrets,

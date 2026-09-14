@@ -481,6 +481,13 @@ impl MockUpstream {
             .route(SUBSCRIPTIONS_PATH, any(handle_quota))
             .route(USAGE_SUMMARY_PATH, any(handle_quota))
             .fallback(any(handle_not_found))
+            // mock 必须与真实上游的承载能力一致：axum 的 Bytes 默认只收 2 MB，
+            // 而真实上游接受大上下文（参考实现 proxy.mjs 的 CC_MAX_BODY_MB=100）。
+            // 若照搬默认值，大请求体的测试会在 mock 这一侧被 413/502 拦掉，
+            // 掩盖被测代理的真实行为（本文件的第 8 节「mock 自身可信度」同源问题）。
+            .layer(axum::extract::DefaultBodyLimit::max(
+                crate::config::DEFAULT_MAX_BODY_BYTES,
+            ))
             .with_state(Arc::clone(&state));
 
         // 端口 0 让内核挑空闲端口，避免测试之间抢端口。

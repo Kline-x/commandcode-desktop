@@ -13,8 +13,14 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     watch: {
-      // src-tauri 由 cargo 自己 watch，Vite 不必重复扫描
-      ignored: ["**/src-tauri/**", "**/crates/**"],
+      // src-tauri / crates 由 cargo 自己 watch，Vite 不必重复扫描。
+      //
+      // ⚠️ `target/` 必须一并忽略：cargo 构建时会写入并**锁定** target 下的
+      // 临时 DLL（proc-macro 产物，如 cssparser_macros-*.dll）。chokidar 一旦
+      // 尝试 watch 这些被独占的文件就会抛 EBUSY 并**直接杀掉 dev server**，
+      // 表现为「跑着跑着 Vite 退出，窗口变成 localhost 拒绝连接」。
+      // target/ 是纯构建产物，前端没有理由监听它。
+      ignored: ["**/target/**", "**/src-tauri/**", "**/crates/**"],
     },
   },
   build: {

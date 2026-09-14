@@ -775,3 +775,183 @@ async fn client_protocol_is_accurately_recorded_for_all_protocols() {
     assert_eq!(recs[4].client_protocol, "openai_responses");
     assert_eq!(recs[5].client_protocol, "anthropic");
 }
+
+// ---------------------------------------------------------------------------
+// 回归测试：以下三条各自对应一个「290 个测试全绿却实际破坏功能」的缺陷。
+// 它们覆盖的不是换号成功路径，而是**副作用与恢复路径**——正是此前缺失的部分。
+// ---------------------------------------------------------------------------
+
+/// 回归：单账号被 429 后，配额探测显示窗口已重置时必须能重新服务。
+///
+/// 此前 `AccountPool::apply_probe` 没有任何生产调用方，账号被标记后在本进程内
+/// 永久不可用，而错误文案却承诺「窗口重置后请求会自动恢复」。
+#[tokio::test]
+async fn rate_limited_account_is_revived_by_a_quota_probe() {
+    let mock = MockUpstream::start([
+        // 第一次请求：429 → 账号被标记
+        MockResponse::HttpError {
+            status: 429,
+            body: r#"{"error":{"code":"rate_limited"}}"#.into(),
+        },
+        // 之后上游恢复正常
+        MockResponse::StreamSuccess {
+            text: "recovered".into(),
+        },
+    ])
+    .await;
+
+    let slots = vec![AccountSlot {
+        id: "only".into(),
+        label: "Only".into(),
+    }];
+    let resolver: cc_server::KeyResolver =
+        Arc::new(|slot: &AccountSlot| Some(format!("key-{}", slot.id)));
+    let state = Arc::new(ProxyState::new(config_for(mock.base_url()), slots, resolver).unwrap());
+
+    let body =
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+
+    let (first, _) = post_chat(state.clone(), body.clone()).await;
+    assert_eq!(
+        first,
+        StatusCode::TOO_MANY_REQUESTS,
+        "第一次应 429 并标记账号"
+    );
+
+    // 没有探测时（修复前的行为）：账号被永久跳过，第二次仍然 429
+    let (still_blocked, _) = post_chat(state.clone(), body.clone()).await;
+    assert_eq!(
+        still_blocked,
+        StatusCode::TOO_MANY_REQUESTS,
+        "标记后、探测前，账号应保持不可用"
+    );
+
+    // 配额轮询拿到「窗口已重置」的快照 → 账号复活
+    state.apply_probe_for_slot(
+        "only",
+        cc_server::window_probe_from_snapshot(&cc_server::QuotaSnapshot {
+            five_hour: Some(cc_server::WindowUsage {
+                used: 1.0,
+                cap: 100.0,
+                exceeded: false,
+                reset_at_ms: 0,
+            }),
+            ..Default::default()
+        }),
+    );
+
+    let (revived, revived_body) = post_chat(state.clone(), body).await;
+    assert_eq!(
+        revived,
+        StatusCode::OK,
+        "窗口重置后账号必须重新可用，而不是要求用户重启应用"
+    );
+    assert_eq!(concat_content(&revived_body), "recovered");
+}
+
+/// 回归：请求侧错误（模型不在套餐）不得污染账号池。
+///
+/// `mark_rejected` 曾在判定可轮换性**之前**无条件调用，于是一次
+/// 403 `MODEL_NOT_IN_PLAN` 就把账号标成不可用——之后所有请求都 429，
+/// 上游一次都不会被打到。
+#[tokio::test]
+async fn plan_error_does_not_poison_the_account_pool() {
+    let mock = MockUpstream::start([
+        MockResponse::HttpError {
+            status: 403,
+            body: r#"{"error":{"code":"MODEL_NOT_IN_PLAN"}}"#.into(),
+        },
+        MockResponse::StreamSuccess { text: "ok".into() },
+    ])
+    .await;
+
+    let slots = vec![AccountSlot {
+        id: "only".into(),
+        label: "Only".into(),
+    }];
+    let resolver: cc_server::KeyResolver =
+        Arc::new(|slot: &AccountSlot| Some(format!("key-{}", slot.id)));
+    let state = Arc::new(ProxyState::new(config_for(mock.base_url()), slots, resolver).unwrap());
+
+    let body =
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+
+    let (first, _) = post_chat(state.clone(), body.clone()).await;
+    assert_eq!(first, StatusCode::FORBIDDEN);
+
+    // 同一个账号再发一次（例如用户换了个模型）：账号本身没问题，必须仍然可用
+    let (second, second_body) = post_chat(state, body).await;
+    assert_eq!(
+        second,
+        StatusCode::OK,
+        "403 模型不在套餐是「请求的问题」不是「账号的问题」；\
+         把它标记成账号不可用会让一次模型不支持的请求废掉整个账号"
+    );
+    assert_eq!(concat_content(&second_body), "ok");
+    assert_eq!(mock.generate_count(), 2);
+}
+
+/// 回归：402（账号额度耗尽）必须触发换号。
+///
+/// docs/PLAN.md 第 8.1 节把「402 被上游折叠成 429」列为最大陷阱：
+/// 402 是**账号级**的额度耗尽，换号有效，必须能与「上游整体限流」区分开。
+#[tokio::test]
+async fn payment_required_rotates_to_the_next_account() {
+    let mock = MockUpstream::start([
+        MockResponse::HttpError {
+            status: 402,
+            body: r#"{"error":{"code":"insufficient_credits"}}"#.into(),
+        },
+        MockResponse::StreamSuccess {
+            text: "from second".into(),
+        },
+    ])
+    .await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    let (status, body) = post_chat(
+        state,
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "402 换号后应成功");
+    assert_eq!(concat_content(&body), "from second");
+    let tokens: Vec<String> = mock
+        .generate_requests()
+        .iter()
+        .filter_map(|r| r.bearer_token().map(str::to_string))
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["key-default".to_string(), "key-second".to_string()],
+        "402 是账号级额度耗尽，必须换号（PLAN.md 8.1）"
+    );
+}
+
+/// 回归：大上下文请求不得被本地 2 MB 默认体限拒绝。
+///
+/// axum 的 `Bytes` 提取器默认只收 2 MB，而编码代理（Claude Code / Cursor）
+/// 会塞进整个仓库上下文；本地就 413 会让代理「完全不工作」。
+#[tokio::test]
+async fn large_context_request_is_not_rejected_locally() {
+    let mock = MockUpstream::start([MockResponse::StreamSuccess { text: "ok".into() }]).await;
+    let state =
+        Arc::new(ProxyState::new(config_for(mock.base_url()), two_slots(), resolver()).unwrap());
+
+    // 3 MB：刚好越过 axum 的 2 MB 默认上限，仍在 100 MB 配置上限之内
+    let big = "x".repeat(3 * 1024 * 1024);
+    let (status, _) = post_chat(
+        state,
+        json!({"model": "m", "messages": [{"role": "user", "content": big}], "stream": true}),
+    )
+    .await;
+
+    assert_ne!(
+        status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "大上下文请求不该在本地被 413 拒绝（上限见 Config::max_body_bytes）"
+    );
+    assert_eq!(status, StatusCode::OK);
+}

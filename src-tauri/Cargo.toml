@@ -24,6 +24,8 @@ cc-server = { path = "../crates/cc-server" }
 tauri = { version = "2", features = ["tray-icon", "image-png", "devtools"] }
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
+# 打开数据目录（设置页的「在访达中打开」）；三平台统一 API
+tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "signal"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

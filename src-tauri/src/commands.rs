@@ -108,12 +108,17 @@ pub struct ControlEndpoint {
     pub proxy_base_url: String,
 }
 
-/// 打开数据目录（托盘与设置页用）。
+/// 打开数据目录（设置页用）。
+///
+/// 此前只把路径写进日志就返回 Ok，而 UI 把它当成功——用户点「在访达中打开」
+/// 什么都不会发生。这里改为真正调用系统文件管理器，并把失败如实回报。
 #[tauri::command]
-pub fn reveal_data_dir(state: State<'_, AppState>) -> Result<(), CommandError> {
-    let dir = state.data_dir.display().to_string();
-    tracing::info!(data_dir = %dir, "数据目录");
-    Ok(())
+pub fn reveal_data_dir(app: AppHandle, state: State<'_, AppState>) -> Result<(), CommandError> {
+    let dir = state.data_dir.clone();
+    tracing::info!(data_dir = %dir.display(), "打开数据目录");
+    tauri_plugin_opener::OpenerExt::opener(&app)
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| CommandError::from(format!("无法打开数据目录 {}：{e}", dir.display())))
 }
 
 /// 从 AppState 取存储句柄。

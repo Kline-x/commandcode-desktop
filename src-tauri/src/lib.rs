@@ -117,6 +117,8 @@ pub fn run() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // 「打开数据目录」需要系统文件管理器
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let handle = app.handle().clone();
             let (state, store, secrets, reloader) = match bootstrap::start(&handle) {

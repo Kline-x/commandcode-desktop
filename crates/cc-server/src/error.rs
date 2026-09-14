@@ -86,10 +86,15 @@ impl CcError {
     /// **这是轮换逻辑的核心判定**：只有「这个账号不行」才换号；
     /// 「这个请求本身不行」（模型不在套餐、参数非法）换号也没用，
     /// 换号反而会把整个账号池误标为耗尽。
+    ///
+    /// 402 与 429 都要算「账号相关」：上游把「该账号额度耗尽」也报成 402/429，
+    /// 换号正是有意义的应对（见 docs/PROTOCOL.md 第 6 节）。
     pub fn rotates_account(&self) -> bool {
         match self {
             CcError::InvalidCredential | CcError::RateLimit { .. } => true,
-            CcError::UpstreamHttp { status, .. } => *status == 401 || *status == 429,
+            CcError::UpstreamHttp { status, .. } => {
+                matches!(*status, 401 | 402 | 429)
+            }
             _ => false,
         }
     }
