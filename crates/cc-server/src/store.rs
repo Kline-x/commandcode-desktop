@@ -4,9 +4,9 @@
 //! 不依赖系统库——这与本项目的单二进制目标一致。
 //!
 //! **加密边界**：本模块只存**密文**（key_cipher）与明文提示（key_hint，
-//! 形如 user_…xxxx）。密钥的加解密由宿主层（Tauri 侧用 stronghold）完成，
-//! cc-server 不碰明文密钥——这样即使数据库文件泄露，也拿不到可用的凭据。
-//! 见 docs/ARCHITECTURE.md 第 7 节的「安全边界」。
+//! 形如 user_…xxxx）。密钥的加解密由宿主层（Tauri 侧，见 `src-tauri/src/secrets.rs`
+//! 的 AES-256-GCM 实现）完成，cc-server 不碰明文密钥——这样即使数据库文件泄露，
+//! 也拿不到可用的凭据。见 docs/ARCHITECTURE.md 第 7 节的「安全边界」。
 //!
 //! **保留策略**：请求流水是唯一会无限增长的表，写入时按 retention 清理，
 //! 避免长期运行把磁盘吃满。
@@ -148,7 +148,12 @@ pub struct NewRequest {
 pub struct Store {
     conn: Mutex<Connection>,
     /// 请求流水的保留条数上限（0 表示不清理）。
-    retention: i64,
+    ///
+    /// 用 `AtomicI64` 而不是普通字段：设置页可以在运行时改它，而 [Store] 是
+    /// 以 `Arc<Store>` 共享的（方法都收 `&self`）。此前这里是只读字段且被
+    /// `bootstrap` 硬编码成 5000，于是设置页保存的「保留条数」能读能显示、
+    /// 却对实际裁剪**毫无影响**——一个会骗人的假设置。
+    retention: std::sync::atomic::AtomicI64,
 }
 
 impl Store {
@@ -169,7 +174,7 @@ impl Store {
             .map_err(db_err)?;
         let store = Self {
             conn: Mutex::new(conn),
-            retention,
+            retention: std::sync::atomic::AtomicI64::new(retention),
         };
         store.migrate()?;
         Ok(store)
@@ -381,10 +386,26 @@ impl Store {
             .map_err(db_err)?;
             Ok(conn.last_insert_rowid())
         })?;
-        if self.retention > 0 {
-            self.trim_requests(self.retention)?;
+        if self.retention() > 0 {
+            self.trim_requests(self.retention())?;
         }
         Ok(id)
+    }
+
+    /// 当前的流水保留条数（0 表示不清理）。
+    pub fn retention(&self) -> i64 {
+        self.retention.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 运行时修改保留条数，并**立即**按新上限裁剪一次。
+    ///
+    /// 立即裁剪是必要的：只改数字的话，用户把上限从 5000 调小到 100 之后，
+    /// 要等到下一次写入请求才会生效——而「下次写入」在空闲期可能永远不来，
+    /// 于是 UI 上显示已生效、数据库里却还是 5000 条。
+    pub fn set_retention(&self, keep: i64) -> Result<usize, CcError> {
+        self.retention
+            .store(keep, std::sync::atomic::Ordering::Relaxed);
+        self.trim_requests(keep)
     }
 
     /// 只保留最近 keep 条请求流水。
@@ -855,6 +876,35 @@ mod tests {
         s.insert_request(&sample_request("a", 200)).unwrap();
         assert_eq!(s.trim_requests(0).unwrap(), 0, "保留条数为 0 表示不清理");
         assert_eq!(s.request_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn set_retention_takes_effect_immediately() {
+        // 回归：retention 曾是只读字段且被 bootstrap 硬编码，设置页改了也没用。
+        // 现在改上限必须【立刻】裁剪，而不是等下一次写入。
+        let s = Store::open_in_memory().unwrap();
+        for i in 0..6 {
+            let mut req = sample_request("a", 200);
+            req.at_ms = 1_000 + i;
+            s.insert_request(&req).unwrap();
+        }
+        assert_eq!(s.request_count().unwrap(), 6, "retention=0 时不清理");
+
+        let trimmed = s.set_retention(2).unwrap();
+        assert_eq!(trimmed, 4, "改小上限应立即删掉多余的 4 条");
+        assert_eq!(s.retention(), 2);
+        assert_eq!(s.request_count().unwrap(), 2, "无需等待下一次写入");
+
+        // 后续写入也遵守新上限
+        let mut req = sample_request("a", 200);
+        req.at_ms = 9_999;
+        s.insert_request(&req).unwrap();
+        assert_eq!(s.request_count().unwrap(), 2);
+        assert_eq!(
+            s.recent_requests(10).unwrap()[0].at_ms,
+            9_999,
+            "保留的仍应是最新的记录"
+        );
     }
 
     #[test]
